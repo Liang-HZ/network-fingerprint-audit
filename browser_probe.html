@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Network Fingerprint Browser Probe</title>
+</head>
+<body data-probe-status="running" data-probe-result="" data-probe-error="">
+  <pre id="status">running</pre>
+  <script>
+    (() => {
+      const statusNode = document.getElementById("status");
+      const result = {
+        startedAt: new Date().toISOString(),
+        navigator: {
+          userAgent: navigator.userAgent,
+          language: navigator.language,
+          languages: navigator.languages,
+          platform: navigator.platform,
+          webdriver: navigator.webdriver,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        },
+        headerEcho: null,
+        headerEchoErrors: [],
+        webrtc: {
+          supported: typeof RTCPeerConnection !== "undefined",
+          candidates: [],
+          errors: [],
+          complete: false,
+        },
+      };
+
+      const encode = (payload) => {
+        const utf8 = encodeURIComponent(JSON.stringify(payload)).replace(/%([0-9A-F]{2})/g, (_, hex) =>
+          String.fromCharCode(parseInt(hex, 16))
+        );
+        return btoa(utf8);
+      };
+
+      const updateDom = (status, error) => {
+        document.body.dataset.probeStatus = status;
+        document.body.dataset.probeError = error || "";
+        document.body.dataset.probeResult = encode(result);
+        statusNode.textContent = JSON.stringify(result, null, 2);
+      };
+
+      const parseCandidate = (raw) => {
+        const tokens = raw.trim().split(/\s+/);
+        const candidate = {
+          raw,
+          foundation: null,
+          component: null,
+          protocol: null,
+          priority: null,
+          address: null,
+          port: null,
+          candidateType: null,
+        };
+
+        if (tokens.length >= 8) {
+          candidate.foundation = tokens[0].replace(/^candidate:/, "");
+          candidate.component = tokens[1];
+          candidate.protocol = tokens[2];
+          candidate.priority = tokens[3];
+          candidate.address = tokens[4];
+          candidate.port = tokens[5];
+        }
+
+        const typeIndex = tokens.indexOf("typ");
+        if (typeIndex !== -1 && tokens[typeIndex + 1]) {
+          candidate.candidateType = tokens[typeIndex + 1];
+        }
+
+        return candidate;
+      };
+
+      const fetchWithTimeout = async (url, timeoutMs) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetch(url, {
+            cache: "no-store",
+            credentials: "omit",
+            signal: controller.signal,
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return await response.json();
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      const collectHeaderEcho = async () => {
+        const urls = [
+          "https://httpbin.org/anything",
+          "https://httpbun.com/get",
+          "https://postman-echo.com/get",
+        ];
+
+        for (const url of urls) {
+          try {
+            const payload = await fetchWithTimeout(url, 8000);
+            result.headerEcho = {
+              url,
+              origin: payload.origin || payload.ip || null,
+              headers: payload.headers || {},
+            };
+            return;
+          } catch (error) {
+            result.headerEchoErrors.push(`${url}: ${error.message}`);
+          }
+        }
+      };
+
+      const collectWebRtc = async () => {
+        if (!result.webrtc.supported) {
+          return;
+        }
+
+        await new Promise((resolve) => {
+          const seen = new Set();
+          let finished = false;
+          const peer = new RTCPeerConnection({
+            iceServers: [
+              { urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] },
+            ],
+          });
+
+          const finish = () => {
+            if (finished) {
+              return;
+            }
+            finished = true;
+            result.webrtc.complete = true;
+            try {
+              peer.close();
+            } catch (_error) {
+            }
+            resolve();
+          };
+
+          const timer = setTimeout(finish, 8000);
+
+          peer.createDataChannel("probe");
+          peer.onicecandidate = (event) => {
+            if (!event.candidate) {
+              clearTimeout(timer);
+              setTimeout(finish, 200);
+              return;
+            }
+
+            const parsed = parseCandidate(event.candidate.candidate);
+            if (!seen.has(parsed.raw)) {
+              seen.add(parsed.raw);
+              result.webrtc.candidates.push(parsed);
+            }
+          };
+
+          peer.onicecandidateerror = (event) => {
+            result.webrtc.errors.push({
+              address: event.address,
+              port: event.port,
+              url: event.url,
+              errorCode: event.errorCode,
+              errorText: event.errorText,
+            });
+          };
+
+          peer.createOffer()
+            .then((offer) => peer.setLocalDescription(offer))
+            .catch((error) => {
+              result.webrtc.errors.push({ stage: "createOffer", message: error.message });
+              clearTimeout(timer);
+              finish();
+            });
+        });
+      };
+
+      Promise.allSettled([collectHeaderEcho(), collectWebRtc()])
+        .then(() => {
+          result.completedAt = new Date().toISOString();
+          updateDom("done", "");
+        })
+        .catch((error) => {
+          result.completedAt = new Date().toISOString();
+          updateDom("error", error.message || String(error));
+        });
+    })();
+  </script>
+</body>
+</html>
