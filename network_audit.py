@@ -1563,13 +1563,29 @@ def render_html(data: dict[str, object]) -> str:
 def write_reports(data: dict[str, object], output_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    json_path = output_dir / f"audit-{stamp}.json"
-    md_path = output_dir / f"audit-{stamp}.md"
-    html_path = output_dir / f"audit-{stamp}.html"
+    suffix = ""
+    counter = 1
+    while True:
+        stem = f"audit-{stamp}{suffix}"
+        json_path = output_dir / f"{stem}.json"
+        md_path = output_dir / f"{stem}.md"
+        html_path = output_dir / f"{stem}.html"
+        if not json_path.exists() and not md_path.exists() and not html_path.exists():
+            break
+        suffix = f"-{counter}"
+        counter += 1
     json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     md_path.write_text(render_markdown(data), encoding="utf-8")
     html_path.write_text(render_html(data), encoding="utf-8")
     return json_path, md_path, html_path
+
+
+def open_report(html_path: pathlib.Path) -> dict[str, object]:
+    completed = run_command("open", str(html_path), timeout=10)
+    return {
+        "ok": completed.get("code") == 0,
+        "stderr": completed.get("stderr", ""),
+    }
 
 
 def main() -> int:
@@ -1593,6 +1609,11 @@ def main() -> int:
         "--browser-path",
         help="Explicit browser binary path for the browser-side probe.",
     )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Generate reports but do not automatically open the HTML report.",
+    )
     args = parser.parse_args()
 
     data = collect_data(
@@ -1601,6 +1622,7 @@ def main() -> int:
         browser_path=args.browser_path,
     )
     json_path, md_path, html_path = write_reports(data, pathlib.Path(args.output_dir))
+    open_result = None if args.no_open else open_report(html_path)
 
     findings = data.get("findings", [])
     high = sum(1 for item in findings if isinstance(item, dict) and item.get("severity") == "high")
@@ -1609,6 +1631,14 @@ def main() -> int:
     print(f"Generated report: {md_path}")
     print(f"Generated report: {json_path}")
     print(f"Generated report: {html_path}")
+    if args.no_open:
+        print("HTML auto-open: disabled by --no-open")
+    elif open_result and open_result.get("ok"):
+        print(f"HTML auto-open: opened {html_path}")
+    else:
+        print(f"HTML auto-open: failed to open {html_path}")
+        if open_result and open_result.get("stderr"):
+            print(f"Open error: {open_result.get('stderr')}")
     print(
         f"High findings: {high} | Medium findings: {medium} | Total findings: {len(findings)} | Browser probe: {browser_probe_status}"
     )

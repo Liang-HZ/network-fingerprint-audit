@@ -20,11 +20,14 @@
 ./bin/audit-network
 ```
 
+默认行为是：生成报告后自动打开最新的 HTML 可视化页。
+
 可选参数：
 
 ```bash
 ./bin/audit-network --skip-network
 ./bin/audit-network --skip-browser-probe
+./bin/audit-network --no-open
 ./bin/audit-network --output-dir ./reports
 ./bin/audit-network --browser-path "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 ```
