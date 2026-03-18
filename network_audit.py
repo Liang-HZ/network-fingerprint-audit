@@ -1104,6 +1104,8 @@ def render_html(data: dict[str, object]) -> str:
     high_count = sum(1 for item in findings if item.get("severity") == "high")
     medium_count = sum(1 for item in findings if item.get("severity") == "medium")
     low_count = sum(1 for item in findings if item.get("severity") == "low")
+    info_count = sum(1 for item in findings if item.get("severity") == "info")
+    total_findings = len(findings)
 
     public_ip = data.get("public_ip", {}) if isinstance(data.get("public_ip"), dict) else {}
     ipinfo = public_ip.get("ipinfo") or {}
@@ -1118,32 +1120,65 @@ def render_html(data: dict[str, object]) -> str:
     def esc(value: object) -> str:
         return html.escape(format_value(value))
 
-    def severity_chip(level: str) -> str:
+    accept_language = get_case_insensitive(header_echo.get("headers"), "Accept-Language")
+    user_agent = get_case_insensitive(header_echo.get("headers"), "User-Agent")
+
+    def chip(level: str) -> str:
         return f'<span class="chip chip-{html.escape(level)}">{html.escape(severity_label(level))}</span>'
 
-    findings_html = []
-    for item in findings:
+    def render_table(headers: list[str], rows: list[list[str]], empty_text: str) -> str:
+        if not rows:
+            return f'<p class="empty">{html.escape(empty_text)}</p>'
+        head = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+        body_rows = []
+        for row in rows:
+            body_rows.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
+        return f"""
+        <div class="table-wrap">
+          <table class="report-table">
+            <thead><tr>{head}</tr></thead>
+            <tbody>{''.join(body_rows)}</tbody>
+          </table>
+        </div>
+        """
+
+    def meter_row(label: str, value: int, css_class: str) -> str:
+        width = 0 if total_findings == 0 else max(6, round(value / total_findings * 100))
+        if value == 0:
+            width = 0
+        return f"""
+        <div class="meter-row">
+          <div class="meter-meta"><span>{html.escape(label)}</span><strong>{value}</strong></div>
+          <div class="meter-track"><div class="meter-fill {css_class}" style="width:{width}%"></div></div>
+        </div>
+        """
+
+    overview_findings = []
+    for item in findings[:4]:
         title, detail = localize_finding(item)
-        findings_html.append(
-            f"""
-            <article class="finding-card level-{html.escape(str(item.get("severity") or "info"))}">
-              <div class="finding-top">
-                {severity_chip(str(item.get("severity") or "info"))}
-                <h3>{html.escape(title)}</h3>
-              </div>
-              <p>{html.escape(detail)}</p>
-            </article>
-            """
+        overview_findings.append(
+            f"<li>{chip(str(item.get('severity') or 'info'))}<div><strong>{html.escape(title)}</strong><p>{html.escape(detail)}</p></div></li>"
         )
 
-    recommendations_html = []
+    finding_rows = []
+    for item in findings:
+        title, detail = localize_finding(item)
+        finding_rows.append(
+            [
+                chip(str(item.get("severity") or "info")),
+                html.escape(title),
+                html.escape(detail),
+            ]
+        )
+
+    recommendation_cards = []
     for item in recommendations:
         priority, area, action, why = localize_recommendation(item)
-        recommendations_html.append(
+        recommendation_cards.append(
             f"""
             <article class="recommend-card">
               <div class="recommend-top">
-                <span class="pill">{html.escape(priority)}</span>
+                <span class="priority">{html.escape(priority)}</span>
                 <h3>{html.escape(area)}</h3>
               </div>
               <p>{html.escape(action)}</p>
@@ -1152,55 +1187,117 @@ def render_html(data: dict[str, object]) -> str:
             """
         )
 
-    browser_language_blocks = []
+    browser_profile_rows: list[list[str]] = []
     for browser in data.get("browser_languages", []):
         if not isinstance(browser, dict):
             continue
-        profiles = []
-        for profile in browser.get("profiles", []):
+        last_used = str(browser.get("last_used") or "")
+        profiles = browser.get("profiles", [])
+        if not isinstance(profiles, list) or not profiles:
+            browser_profile_rows.append(
+                [html.escape(str(browser.get("browser") or "浏览器")), "未发现", "未发现", html.escape(last_used or "未知")]
+            )
+            continue
+        for profile in profiles:
             if not isinstance(profile, dict):
                 continue
-            profiles.append(
-                f"<li><strong>{html.escape(str(profile.get('profile') or '未知'))}</strong><span>{html.escape(str(profile.get('accept_languages') or '未知'))}</span></li>"
+            current_name = str(profile.get("profile") or "未知")
+            is_active = "是" if current_name == last_used and last_used else ""
+            browser_profile_rows.append(
+                [
+                    html.escape(str(browser.get("browser") or "浏览器")),
+                    html.escape(current_name),
+                    html.escape(str(profile.get("accept_languages") or "未知")),
+                    html.escape(is_active or "否"),
+                ]
             )
-        browser_language_blocks.append(
-            f"""
-            <div class="subcard">
-              <div class="subcard-head">
-                <h3>{html.escape(str(browser.get("browser") or "浏览器"))}</h3>
-                <span>最近使用：{html.escape(str(browser.get("last_used") or "未知"))}</span>
-              </div>
-              <ul class="profile-list">{"".join(profiles) or "<li><span>未发现 profile 语言配置</span></li>"}</ul>
-            </div>
-            """
-        )
 
-    webrtc_candidates = []
+    probe_rows = [
+        ["状态", html.escape(probe_status_label(str(browser_probe.get("status") or "")))],
+        ["浏览器", esc(browser_probe.get("browser_path"))],
+        ["语言提示", esc(browser_probe.get("language_hint"))],
+        ["备注", html.escape(localize_browser_probe_note(str(browser_probe.get("note") or "")) or localize_browser_probe_reason(str(browser_probe.get("reason") or "")) or "无")],
+        ["navigator.language", esc(navigator_info.get("language"))],
+        ["navigator.languages", esc(navigator_info.get("languages"))],
+        ["浏览器时区", esc(navigator_info.get("timezone"))],
+        ["回显站点看到的 IP", esc(header_echo.get("origin"))],
+        ["Accept-Language", esc(accept_language)],
+        ["User-Agent", esc(user_agent)],
+    ]
+
+    candidate_rows = []
     for candidate in webrtc.get("candidates", []):
         if not isinstance(candidate, dict):
             continue
-        webrtc_candidates.append(
-            f"<li><strong>{html.escape(str(candidate.get('candidateType') or 'unknown'))}</strong><span>{html.escape(str(candidate.get('protocol') or 'unknown'))}</span><code>{html.escape(str(candidate.get('address') or 'unknown'))}:{html.escape(str(candidate.get('port') or 'unknown'))}</code></li>"
+        scope = candidate_address_scope(str(candidate.get("address") or ""))
+        scope_text = {
+            "mdns": "mDNS 混淆",
+            "private": "私网",
+            "public": "公网",
+            "hostname": "主机名",
+            "unknown": "未知",
+        }.get(scope, scope)
+        candidate_rows.append(
+            [
+                html.escape(str(candidate.get("candidateType") or "unknown")),
+                html.escape(str(candidate.get("protocol") or "unknown")),
+                f"<code>{html.escape(str(candidate.get('address') or 'unknown'))}:{html.escape(str(candidate.get('port') or 'unknown'))}</code>",
+                html.escape(scope_text),
+            ]
         )
 
-    clash_blocks = []
+    network_rows = [
+        ["公网 IP", esc(ipinfo.get("ip") or ifconfig.get("ip"))],
+        ["ASN / 组织", esc(ipinfo.get("org") or ifconfig.get("asn_org"))],
+        ["位置", esc(f"{ipinfo.get('city') or ifconfig.get('city') or '未知'}，{ipinfo.get('region') or ifconfig.get('region_name') or ''} {ipinfo.get('country') or ifconfig.get('country_iso') or ''}")],
+        ["时区", esc(ipinfo.get("timezone") or ifconfig.get("time_zone"))],
+        ["系统 DNS", esc(", ".join((data.get("dns") or {}).get("nameservers", [])))],
+        ["Wi‑Fi DNS", esc((data.get("dns") or {}).get("wifi_dns_raw"))],
+        ["LANG", esc((data.get("locale") or {}).get("lang"))],
+        ["AppleLanguages", esc((data.get("locale") or {}).get("apple_languages"))],
+        ["AppleLocale", esc((data.get("locale") or {}).get("apple_locale"))],
+        ["本地时间", esc((data.get("locale") or {}).get("timestamp"))],
+    ]
+
+    route_rows = []
+    default_route = (data.get("route") or {}).get("default") or {}
+    if isinstance(default_route, dict):
+        for key in ("gateway", "interface", "destination", "mask"):
+            route_rows.append([html.escape(key), esc(default_route.get(key))])
+    split_routes = (data.get("route") or {}).get("split_tunnel_routes") or []
+    if isinstance(split_routes, list):
+        route_rows.append(["TUN 分流条目数", html.escape(str(len(split_routes)))])
+
+    listener_rows = []
+    listeners = data.get("listeners") or {}
+    if isinstance(listeners, dict):
+        listener_rows = [
+            ["127.0.0.1:53 TCP", "监听中" if listeners.get("tcp_127_0_0_1_53") else "未监听"],
+            ["127.0.0.1:53 UDP", "监听中" if listeners.get("udp_127_0_0_1_53") else "未监听"],
+            ["127.0.0.1:7890 TCP", "监听中" if listeners.get("tcp_127_0_0_1_7890") else "未监听"],
+        ]
+
+    proxy_rows = [
+        ["Web 代理", esc((data.get("networksetup") or {}).get("web_proxy"))],
+        ["HTTPS 代理", esc((data.get("networksetup") or {}).get("secure_web_proxy"))],
+        ["SOCKS 代理", esc((data.get("networksetup") or {}).get("socks_proxy"))],
+        ["自动代理 URL", esc((data.get("networksetup") or {}).get("auto_proxy_url"))],
+        ["自动代理发现", esc((data.get("networksetup") or {}).get("auto_proxy_discovery"))],
+    ]
+
+    clash_details = []
     for config in (data.get("clash", {}) or {}).get("configs", []):
         if not isinstance(config, dict):
             continue
-        excerpts = "".join(f"<li><code>{html.escape(str(line))}</code></li>" for line in config.get("excerpt", []))
-        clash_blocks.append(
+        excerpt = "\n".join(str(line) for line in config.get("excerpt", []))
+        clash_details.append(
             f"""
-            <div class="subcard">
-              <div class="subcard-head">
-                <h3>{html.escape(str(config.get("path") or "配置文件"))}</h3>
-              </div>
-              <ul class="code-list">{excerpts}</ul>
-            </div>
+            <details class="detail-block">
+              <summary>{html.escape(str(config.get("path") or "配置文件"))}</summary>
+              <pre>{html.escape(excerpt)}</pre>
+            </details>
             """
         )
-
-    accept_language = get_case_insensitive(header_echo.get("headers"), "Accept-Language")
-    user_agent = get_case_insensitive(header_echo.get("headers"), "User-Agent")
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1210,351 +1307,575 @@ def render_html(data: dict[str, object]) -> str:
   <title>网络环境指纹审计报告</title>
   <style>
     :root {{
-      --bg: #f6f1e8;
-      --panel: rgba(255,255,255,0.78);
-      --panel-strong: rgba(255,255,255,0.9);
-      --ink: #201812;
-      --muted: #6b5d4f;
-      --line: rgba(50, 36, 24, 0.12);
-      --accent: #9d4f2f;
-      --accent-soft: #e7b98d;
-      --high: #b33a2b;
-      --medium: #d17b0f;
-      --low: #4f7d61;
-      --info: #5c6d9e;
-      --shadow: 0 24px 80px rgba(43, 27, 18, 0.12);
+      --bg: #eef2f6;
+      --sidebar: #101720;
+      --sidebar-line: rgba(255,255,255,0.1);
+      --panel: #ffffff;
+      --panel-alt: #f8fafc;
+      --ink: #18212b;
+      --muted: #667483;
+      --line: #d7e0ea;
+      --accent: #1f6feb;
+      --high: #d43d2a;
+      --medium: #d27a00;
+      --low: #2d8a59;
+      --info: #596b95;
+      --shadow: 0 14px 42px rgba(10, 24, 40, 0.08);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       color: var(--ink);
+      background: linear-gradient(180deg, #eef2f6 0%, #e9eef4 100%);
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.55;
+    }}
+    .layout {{
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }}
+    aside {{
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      padding: 28px 22px;
       background:
-        radial-gradient(circle at top left, rgba(212, 153, 109, 0.32), transparent 28%),
-        radial-gradient(circle at top right, rgba(129, 152, 212, 0.22), transparent 32%),
-        linear-gradient(180deg, #f8f3eb 0%, #f1e6d6 100%);
-      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
-      line-height: 1.6;
+        radial-gradient(circle at top left, rgba(70, 120, 255, 0.18), transparent 30%),
+        linear-gradient(180deg, #101720 0%, #15202c 100%);
+      color: #eff4fb;
+      border-right: 1px solid var(--sidebar-line);
+    }}
+    .brand {{
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #93b8ff;
+      margin-bottom: 14px;
+    }}
+    aside h1 {{
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.05;
+      font-weight: 700;
+    }}
+    .sidebar-copy {{
+      color: rgba(239,244,251,0.72);
+      font-size: 14px;
+      margin-bottom: 22px;
+    }}
+    .sidebar-meta {{
+      display: grid;
+      gap: 10px;
+      padding: 16px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      margin-bottom: 18px;
+    }}
+    .sidebar-meta label {{
+      display: block;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: rgba(147,184,255,0.82);
+      margin-bottom: 4px;
+    }}
+    .sidebar-meta span {{
+      display: block;
+      word-break: break-word;
+      font-size: 14px;
+    }}
+    .nav {{
+      display: grid;
+      gap: 8px;
+      margin-top: 16px;
+    }}
+    .nav a {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: #eff4fb;
+      text-decoration: none;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid transparent;
+    }}
+    .nav a:hover {{
+      border-color: rgba(147,184,255,0.35);
+      background: rgba(147,184,255,0.08);
     }}
     main {{
-      width: min(1180px, calc(100vw - 40px));
-      margin: 28px auto 44px;
+      padding: 28px 32px 44px;
+      width: min(1280px, 100%);
     }}
-    .hero, section {{
+    .report-hero, section {{
       background: var(--panel);
-      backdrop-filter: blur(14px);
       border: 1px solid var(--line);
-      border-radius: 28px;
+      border-radius: 22px;
       box-shadow: var(--shadow);
     }}
-    .hero {{
-      padding: 34px;
-      overflow: hidden;
-      position: relative;
-    }}
-    .hero::after {{
-      content: "";
-      position: absolute;
-      inset: auto -20% -45% auto;
-      width: 320px;
-      height: 320px;
-      border-radius: 999px;
-      background: radial-gradient(circle, rgba(157,79,47,0.22), transparent 68%);
-      pointer-events: none;
+    .report-hero {{
+      padding: 26px;
     }}
     .eyebrow {{
-      letter-spacing: 0.18em;
+      letter-spacing: 0.16em;
       text-transform: uppercase;
       color: var(--accent);
       font-size: 12px;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
     }}
-    h1 {{
-      margin: 0 0 12px;
-      font-size: clamp(34px, 5vw, 58px);
-      line-height: 1.02;
+    .report-hero h2 {{
+      margin: 0;
+      font-size: clamp(30px, 4vw, 44px);
+      line-height: 1.06;
       font-weight: 700;
     }}
-    .hero p {{
-      max-width: 720px;
-      color: var(--muted);
-      margin: 0 0 18px;
-      font-size: 17px;
+    .hero-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+      gap: 18px;
+      margin-top: 18px;
     }}
-    .meta {{
+    .hero-copy {{
+      color: var(--muted);
+      margin-top: 12px;
+      max-width: 760px;
+      font-size: 15px;
+    }}
+    .hero-meta {{
       display: flex;
       flex-wrap: wrap;
-      gap: 12px;
+      gap: 10px 16px;
       color: var(--muted);
       font-size: 14px;
+      margin-top: 14px;
     }}
     .stats {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 14px;
-      margin-top: 24px;
     }}
     .stat {{
-      padding: 18px 20px;
-      border-radius: 22px;
-      background: var(--panel-strong);
+      padding: 18px;
+      border-radius: 16px;
+      background: var(--panel-alt);
       border: 1px solid var(--line);
     }}
     .stat-label {{
       color: var(--muted);
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.14em;
+      letter-spacing: 0.12em;
     }}
     .stat-value {{
       margin-top: 8px;
-      font-size: 28px;
+      font-size: 26px;
       font-weight: 700;
+    }}
+    .hero-side {{
+      padding: 18px;
+      border-radius: 18px;
+      background: #0f1720;
+      color: #eff4fb;
+      display: grid;
+      gap: 12px;
+    }}
+    .hero-side h3 {{
+      margin: 0;
+      font-size: 18px;
+    }}
+    .hero-side p {{
+      margin: 0;
+      color: rgba(239,244,251,0.72);
+      font-size: 14px;
     }}
     section {{
       margin-top: 20px;
-      padding: 26px;
+      padding: 24px;
     }}
-    section h2 {{
-      margin: 0 0 18px;
-      font-size: 28px;
+    .section-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 16px;
+    }}
+    .section-head h2 {{
+      margin: 0;
+      font-size: 26px;
+    }}
+    .section-head span {{
+      color: var(--muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
     }}
     .section-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
       gap: 16px;
     }}
-    .finding-grid, .recommend-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 16px;
-    }}
-    .finding-card, .recommend-card, .subcard {{
-      background: var(--panel-strong);
+    .report-panel, .recommend-card, .table-panel {{
+      background: var(--panel-alt);
       border: 1px solid var(--line);
-      border-radius: 22px;
+      border-radius: 18px;
       padding: 18px;
     }}
-    .finding-card p, .recommend-card p, .subcard p {{
-      margin: 12px 0 0;
-      color: var(--muted);
-    }}
-    .finding-top, .recommend-top, .subcard-head {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }}
-    .finding-top h3, .recommend-top h3, .subcard-head h3 {{
-      margin: 0;
-      font-size: 20px;
-    }}
-    .chip, .pill {{
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      border: 1px solid currentColor;
-    }}
-    .chip-high {{ color: var(--high); background: rgba(179,58,43,0.09); }}
-    .chip-medium {{ color: var(--medium); background: rgba(209,123,15,0.1); }}
-    .chip-low {{ color: var(--low); background: rgba(79,125,97,0.1); }}
-    .chip-info {{ color: var(--info); background: rgba(92,109,158,0.1); }}
-    .pill {{ color: var(--accent); background: rgba(157,79,47,0.08); }}
-    .metric-list, .profile-list, .code-list, .candidate-list {{
+    .overview-list {{
       list-style: none;
       padding: 0;
       margin: 0;
       display: grid;
-      gap: 10px;
+      gap: 12px;
     }}
-    .metric-list li, .profile-list li, .candidate-list li {{
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 10px 0;
+    .overview-list li {{
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+      align-items: start;
+      padding-bottom: 12px;
       border-bottom: 1px solid var(--line);
-      color: var(--muted);
     }}
-    .metric-list li:last-child, .profile-list li:last-child, .candidate-list li:last-child {{
+    .overview-list li:last-child {{
       border-bottom: 0;
       padding-bottom: 0;
     }}
-    .metric-list strong, .profile-list strong, .candidate-list strong {{
-      color: var(--ink);
-      min-width: 112px;
+    .overview-list strong {{
+      display: block;
+      margin-bottom: 4px;
+    }}
+    .overview-list p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .meter-stack {{
+      display: grid;
+      gap: 12px;
+    }}
+    .meter-row {{
+      display: grid;
+      gap: 8px;
+    }}
+    .meter-meta {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 14px;
+    }}
+    .meter-track {{
+      height: 10px;
+      border-radius: 999px;
+      background: #e9eef4;
+      overflow: hidden;
+    }}
+    .meter-fill {{
+      height: 100%;
+      border-radius: 999px;
+    }}
+    .meter-fill.high {{ background: var(--high); }}
+    .meter-fill.medium {{ background: var(--medium); }}
+    .meter-fill.low {{ background: var(--low); }}
+    .meter-fill.info {{ background: var(--info); }}
+    .chip, .priority {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }}
+    .chip-high {{ color: var(--high); background: rgba(212,61,42,0.12); }}
+    .chip-medium {{ color: var(--medium); background: rgba(210,122,0,0.12); }}
+    .chip-low {{ color: var(--low); background: rgba(45,138,89,0.12); }}
+    .chip-info {{ color: var(--info); background: rgba(89,107,149,0.12); }}
+    .priority {{ color: var(--accent); background: rgba(31,111,235,0.12); }}
+    .recommend-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }}
+    .recommend-card h3 {{
+      margin: 0;
+      font-size: 18px;
+    }}
+    .recommend-top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 10px;
+    }}
+    .recommend-card p {{
+      margin: 0;
+      color: var(--muted);
     }}
     code {{
-      font-family: "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
+      font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
       font-size: 12px;
-      background: rgba(35, 24, 18, 0.06);
-      border-radius: 10px;
+      background: #eef3f8;
+      border-radius: 8px;
       padding: 3px 6px;
       word-break: break-all;
     }}
-    .code-list li {{
-      margin: 0 0 8px;
+    .table-wrap {{
+      overflow-x: auto;
+    }}
+    .report-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }}
+    .report-table th {{
+      text-align: left;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 0 0 12px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .report-table td {{
+      padding: 14px 0;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      color: var(--ink);
+    }}
+    .report-table tbody tr:last-child td {{
+      border-bottom: 0;
+    }}
+    .report-table td + td,
+    .report-table th + th {{
+      padding-left: 16px;
+    }}
+    .detail-block {{
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel-alt);
+      padding: 14px 16px;
+    }}
+    .detail-block + .detail-block {{
+      margin-top: 12px;
+    }}
+    .detail-block summary {{
+      cursor: pointer;
+      font-weight: 600;
+    }}
+    .detail-block pre {{
+      margin: 12px 0 0;
+      padding: 16px;
+      border-radius: 12px;
+      background: #0f1720;
+      color: #dce7f3;
+      overflow: auto;
+      font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }}
+    .empty {{
+      color: var(--muted);
+      margin: 0;
     }}
     .why {{
       font-size: 14px;
+      margin-top: 10px !important;
     }}
-    .muted {{
-      color: var(--muted);
+    @media (max-width: 1080px) {{
+      .layout {{
+        grid-template-columns: 1fr;
+      }}
+      aside {{
+        position: static;
+        height: auto;
+      }}
+      main {{
+        padding: 20px;
+      }}
+      .hero-grid {{
+        grid-template-columns: 1fr;
+      }}
     }}
     @media (max-width: 720px) {{
       main {{
-        width: min(100vw - 24px, 100%);
-        margin: 12px auto 28px;
+        padding: 14px;
       }}
-      .hero, section {{
-        border-radius: 22px;
+      section, .report-hero {{
+        padding: 18px;
       }}
-      .hero {{
-        padding: 24px;
-      }}
-      section {{
-        padding: 20px;
-      }}
-      .metric-list li, .profile-list li, .candidate-list li {{
-        flex-direction: column;
+      .report-table td + td,
+      .report-table th + th {{
+        padding-left: 10px;
       }}
     }}
   </style>
 </head>
 <body>
-  <main>
-    <header class="hero">
-      <div class="eyebrow">Network Fingerprint Audit</div>
-      <h1>网络环境指纹审计报告</h1>
-      <p>把 DNS、代理、浏览器语言、WebRTC、出口 ASN 和本机区域信号放进一份可读报告里，方便你快速判断哪些地方还存在不一致。</p>
-      <div class="meta">
-        <span>生成时间：{esc(data.get("generated_at"))}</span>
-        <span>主机名：{esc((data.get("host") or {}).get("hostname"))}</span>
+  <div class="layout">
+    <aside>
+      <div class="brand">Report Navigator</div>
+      <h1>网络环境<br>指纹审计</h1>
+      <p class="sidebar-copy">参考 NodeSecure/report 这类“结构化报告”的阅读方式重做，重点是目录、概览、表格和模块化信息密度。</p>
+      <div class="sidebar-meta">
+        <div><label>生成时间</label><span>{esc(data.get("generated_at"))}</span></div>
+        <div><label>主机名</label><span>{esc((data.get("host") or {}).get("hostname"))}</span></div>
+        <div><label>公网出口</label><span>{esc(ipinfo.get("ip") or ifconfig.get("ip"))}</span></div>
+        <div><label>浏览器探针</label><span>{html.escape(probe_status_label(str(browser_probe.get("status") or "")))}</span></div>
       </div>
-      <div class="stats">
-        <div class="stat">
-          <div class="stat-label">高风险项</div>
-          <div class="stat-value">{high_count}</div>
+      <nav class="nav">
+        <a href="#overview"><span>概览</span><span>{total_findings} 项</span></a>
+        <a href="#findings"><span>主要发现</span><span>{high_count}/{medium_count}</span></a>
+        <a href="#actions"><span>修复建议</span><span>{len(recommendations)}</span></a>
+        <a href="#browser"><span>浏览器与 WebRTC</span><span>{len(webrtc.get("candidates", []))}</span></a>
+        <a href="#network"><span>网络与区域</span><span>{esc(", ".join((data.get("dns") or {}).get("nameservers", [])) or "未知")}</span></a>
+        <a href="#proxy"><span>代理与路由</span><span>{esc((default_route or {}).get("interface"))}</span></a>
+        <a href="#clash"><span>Clash 快照</span><span>{len((data.get("clash") or {}).get("configs", []))}</span></a>
+      </nav>
+    </aside>
+    <main>
+      <header class="report-hero" id="overview">
+        <div class="eyebrow">Network Fingerprint Audit</div>
+        <h2>把所有“会露馅的信号”放进一份真正能读的报告里</h2>
+        <p class="hero-copy">这份报告把出口、DNS、系统语言、浏览器 profile、浏览器请求头和 WebRTC 候选放进统一视图，优先给你结论，再给你证据，而不是把原始字段散在页面各处。</p>
+        <div class="hero-meta">
+          <span>报告格式：HTML / Markdown / JSON</span>
+          <span>浏览器探针：{html.escape(probe_status_label(str(browser_probe.get("status") or "")))}</span>
+          <span>出口 ASN：{esc(ipinfo.get("org") or ifconfig.get("asn_org"))}</span>
         </div>
-        <div class="stat">
-          <div class="stat-label">中风险项</div>
-          <div class="stat-value">{medium_count}</div>
+        <div class="hero-grid">
+          <div class="report-panel">
+            <div class="section-head">
+              <h2>摘要</h2>
+              <span>Top Signals</span>
+            </div>
+            <ul class="overview-list">
+              {"".join(overview_findings) or '<li><div><strong>当前没有明显异常</strong><p>本次审计没有发现需要优先处理的问题。</p></div></li>'}
+            </ul>
+          </div>
+          <div class="hero-side">
+            <h3>严重度分布</h3>
+            <p>不是所有异常都该同优先级处理。先看高风险与中风险，再去收尾信息项。</p>
+            <div class="stats">
+              <div class="stat">
+                <div class="stat-label">高风险</div>
+                <div class="stat-value">{high_count}</div>
+              </div>
+              <div class="stat">
+                <div class="stat-label">中风险</div>
+                <div class="stat-value">{medium_count}</div>
+              </div>
+              <div class="stat">
+                <div class="stat-label">低风险</div>
+                <div class="stat-value">{low_count}</div>
+              </div>
+              <div class="stat">
+                <div class="stat-label">信息项</div>
+                <div class="stat-value">{info_count}</div>
+              </div>
+            </div>
+            <div class="meter-stack">
+              {meter_row("高风险", high_count, "high")}
+              {meter_row("中风险", medium_count, "medium")}
+              {meter_row("低风险", low_count, "low")}
+              {meter_row("信息项", info_count, "info")}
+            </div>
+          </div>
         </div>
-        <div class="stat">
-          <div class="stat-label">低风险项</div>
-          <div class="stat-value">{low_count}</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">浏览器探针</div>
-          <div class="stat-value">{html.escape(probe_status_label(str(browser_probe.get("status") or "")))}</div>
-        </div>
-      </div>
-    </header>
+      </header>
 
-    <section>
-      <h2>主要发现</h2>
-      <div class="finding-grid">
-        {"".join(findings_html) or '<p class="muted">当前没有发现明显的高信号不一致项。</p>'}
-      </div>
-    </section>
+      <section id="findings">
+        <div class="section-head">
+          <h2>主要发现</h2>
+          <span>{total_findings} Findings</span>
+        </div>
+        {render_table(["严重度", "问题", "说明"], finding_rows, "当前没有可展示的发现。")}
+      </section>
 
-    <section>
-      <h2>修复建议</h2>
-      <div class="recommend-grid">
-        {"".join(recommendations_html)}
-      </div>
-    </section>
+      <section id="actions">
+        <div class="section-head">
+          <h2>修复建议</h2>
+          <span>{len(recommendations)} Actions</span>
+        </div>
+        <div class="recommend-grid">
+          {"".join(recommendation_cards)}
+        </div>
+      </section>
 
-    <section>
-      <h2>关键信号总览</h2>
-      <div class="section-grid">
-        <div class="subcard">
-          <div class="subcard-head"><h3>公网出口</h3></div>
-          <ul class="metric-list">
-            <li><strong>IP</strong><span>{esc(ipinfo.get("ip") or ifconfig.get("ip"))}</span></li>
-            <li><strong>ASN / 组织</strong><span>{esc(ipinfo.get("org") or ifconfig.get("asn_org"))}</span></li>
-            <li><strong>位置</strong><span>{esc(f"{ipinfo.get('city') or ifconfig.get('city') or '未知'}，{ipinfo.get('region') or ifconfig.get('region_name') or ''} {ipinfo.get('country') or ifconfig.get('country_iso') or ''}")}</span></li>
-            <li><strong>时区</strong><span>{esc(ipinfo.get("timezone") or ifconfig.get("time_zone"))}</span></li>
-          </ul>
+      <section id="browser">
+        <div class="section-head">
+          <h2>浏览器与 WebRTC</h2>
+          <span>Browser-side Evidence</span>
         </div>
-        <div class="subcard">
-          <div class="subcard-head"><h3>DNS 信号</h3></div>
-          <ul class="metric-list">
-            <li><strong>系统 DNS</strong><span>{esc(", ".join((data.get("dns") or {}).get("nameservers", [])))}</span></li>
-            <li><strong>Wi‑Fi DNS</strong><span>{esc((data.get("dns") or {}).get("wifi_dns_raw"))}</span></li>
-            <li><strong>NWI</strong><span>{esc(str((data.get("dns") or {}).get("nwi") or "").replace(chr(10), " | "))}</span></li>
-          </ul>
+        <div class="section-grid">
+          <div class="table-panel">
+            <div class="section-head">
+              <h2>浏览器 Profile 语言</h2>
+              <span>Profiles</span>
+            </div>
+            {render_table(["浏览器", "Profile", "Accept-Language", "最近使用"], browser_profile_rows, "未发现浏览器 profile 语言配置。")}
+          </div>
+          <div class="table-panel">
+            <div class="section-head">
+              <h2>浏览器探针元数据</h2>
+              <span>Probe</span>
+            </div>
+            {render_table(["字段", "值"], probe_rows, "浏览器探针暂无数据。")}
+          </div>
         </div>
-        <div class="subcard">
-          <div class="subcard-head"><h3>语言与区域</h3></div>
-          <ul class="metric-list">
-            <li><strong>LANG</strong><span>{esc((data.get("locale") or {}).get("lang"))}</span></li>
-            <li><strong>AppleLanguages</strong><span>{esc((data.get("locale") or {}).get("apple_languages"))}</span></li>
-            <li><strong>AppleLocale</strong><span>{esc((data.get("locale") or {}).get("apple_locale"))}</span></li>
-            <li><strong>本地时间</strong><span>{esc((data.get("locale") or {}).get("timestamp"))}</span></li>
-          </ul>
+        <div class="table-panel" style="margin-top:16px;">
+          <div class="section-head">
+            <h2>WebRTC ICE 候选</h2>
+            <span>{len(candidate_rows)} Candidates</span>
+          </div>
+          {render_table(["类型", "协议", "地址", "范围"], candidate_rows, "未采集到 WebRTC 候选。")}
         </div>
-        <div class="subcard">
-          <div class="subcard-head"><h3>代理设置</h3></div>
-          <ul class="metric-list">
-            <li><strong>Web</strong><span>{esc((data.get("networksetup") or {}).get("web_proxy"))}</span></li>
-            <li><strong>HTTPS</strong><span>{esc((data.get("networksetup") or {}).get("secure_web_proxy"))}</span></li>
-            <li><strong>SOCKS</strong><span>{esc((data.get("networksetup") or {}).get("socks_proxy"))}</span></li>
-            <li><strong>自动发现</strong><span>{esc((data.get("networksetup") or {}).get("auto_proxy_discovery"))}</span></li>
-          </ul>
-        </div>
-      </div>
-    </section>
+      </section>
 
-    <section>
-      <h2>浏览器语言配置</h2>
-      <div class="section-grid">
-        {"".join(browser_language_blocks) or '<p class="muted">未发现浏览器 profile 语言配置。</p>'}
-      </div>
-    </section>
+      <section id="network">
+        <div class="section-head">
+          <h2>网络与区域信号</h2>
+          <span>Host + Egress</span>
+        </div>
+        <div class="section-grid">
+          <div class="table-panel">
+            <div class="section-head">
+              <h2>出口 / DNS / 区域</h2>
+              <span>Signals</span>
+            </div>
+            {render_table(["字段", "值"], network_rows, "暂无网络信号数据。")}
+          </div>
+          <div class="table-panel">
+            <div class="section-head">
+              <h2>默认路由与监听</h2>
+              <span>Route + Local</span>
+            </div>
+            {render_table(["字段", "值"], route_rows + listener_rows, "暂无路由或监听数据。")}
+          </div>
+        </div>
+      </section>
 
-    <section>
-      <h2>浏览器侧探针</h2>
-      <div class="section-grid">
-        <div class="subcard">
-          <div class="subcard-head"><h3>探针状态</h3></div>
-          <ul class="metric-list">
-            <li><strong>状态</strong><span>{html.escape(probe_status_label(str(browser_probe.get("status") or "")))}</span></li>
-            <li><strong>浏览器</strong><span>{esc(browser_probe.get("browser_path"))}</span></li>
-            <li><strong>语言提示</strong><span>{esc(browser_probe.get("language_hint"))}</span></li>
-            <li><strong>备注</strong><span>{html.escape(localize_browser_probe_note(str(browser_probe.get("note") or "")) or localize_browser_probe_reason(str(browser_probe.get("reason") or "")) or "无")}</span></li>
-          </ul>
+      <section id="proxy">
+        <div class="section-head">
+          <h2>代理设置</h2>
+          <span>System Proxy</span>
         </div>
-        <div class="subcard">
-          <div class="subcard-head"><h3>浏览器头与时区</h3></div>
-          <ul class="metric-list">
-            <li><strong>navigator.language</strong><span>{esc(navigator_info.get("language"))}</span></li>
-            <li><strong>navigator.languages</strong><span>{esc(navigator_info.get("languages"))}</span></li>
-            <li><strong>回显出口 IP</strong><span>{esc(header_echo.get("origin"))}</span></li>
-            <li><strong>Accept-Language</strong><span>{esc(accept_language)}</span></li>
-            <li><strong>User-Agent</strong><span>{esc(user_agent)}</span></li>
-            <li><strong>浏览器时区</strong><span>{esc(navigator_info.get("timezone"))}</span></li>
-          </ul>
-        </div>
-        <div class="subcard">
-          <div class="subcard-head"><h3>WebRTC ICE 候选</h3></div>
-          <ul class="candidate-list">
-            {"".join(webrtc_candidates) or '<li><span>未采集到候选</span></li>'}
-          </ul>
-        </div>
-      </div>
-    </section>
+        {render_table(["字段", "值"], proxy_rows, "暂无代理设置数据。")}
+      </section>
 
-    <section>
-      <h2>Clash 运行态快照</h2>
-      <div class="section-grid">
-        {"".join(clash_blocks) or '<p class="muted">未发现可读的 Clash 运行态配置。</p>'}
-      </div>
-    </section>
-  </main>
+      <section id="clash">
+        <div class="section-head">
+          <h2>Clash 运行态快照</h2>
+          <span>{len((data.get("clash") or {}).get("configs", []))} Files</span>
+        </div>
+        {"".join(clash_details) or '<p class="empty">未发现可读的 Clash 运行态配置。</p>'}
+      </section>
+    </main>
+  </div>
 </body>
 </html>
 """

@@ -12,7 +12,7 @@
 - 启动临时 headless Chrome/Chromium，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC ICE 候选
 - 检查常见 Clash Verge / Mihomo 运行态配置快照
 - 基于结果自动生成优先级修复建议
-- 自动输出中文 Markdown、HTML 可视化报告和 JSON 到 `reports/`
+- 自动输出中文 Markdown、结构化 HTML 报告和 JSON 到 `reports/`
 
 ## 用法
 
@@ -40,7 +40,19 @@
 - `reports/audit-YYYYMMDD-HHMMSS.html`
 - `reports/audit-YYYYMMDD-HHMMSS.json`
 
-Markdown 适合快速看结论，HTML 适合直接可视化查看，JSON 适合后续接别的自动化。
+Markdown 适合快速看结论，HTML 适合像审计报告一样按模块浏览，JSON 适合后续接别的自动化。
+
+## HTML 报告结构
+
+HTML 报告默认自动打开，采用偏“报告”而不是“展示页”的结构：
+
+- 左侧固定目录，便于在长报告里快速跳转
+- 顶部概览区，先看高/中/低风险分布和摘要
+- `主要发现` 用表格集中展示问题和说明
+- `修复建议` 按优先级拆开，方便照着处理
+- `浏览器与 WebRTC`、`网络与区域信号`、`代理设置`、`Clash 快照` 分模块展开
+
+这份布局更适合排障、复查和对比，不需要在很多卡片里来回找信息。
 
 ## 依赖
 
