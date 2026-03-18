@@ -12,7 +12,7 @@
 - 启动临时 headless Chrome/Chromium，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC ICE 候选
 - 检查常见 Clash Verge / Mihomo 运行态配置快照
 - 基于结果自动生成优先级修复建议
-- 自动输出 Markdown 和 JSON 报告到 `reports/`
+- 自动输出中文 Markdown、HTML 可视化报告和 JSON 到 `reports/`
 
 ## 用法
 
@@ -34,9 +34,10 @@
 运行后会生成：
 
 - `reports/audit-YYYYMMDD-HHMMSS.md`
+- `reports/audit-YYYYMMDD-HHMMSS.html`
 - `reports/audit-YYYYMMDD-HHMMSS.json`
 
-Markdown 适合直接看结论，JSON 适合后续接别的自动化。
+Markdown 适合快速看结论，HTML 适合直接可视化查看，JSON 适合后续接别的自动化。
 
 ## 依赖
 
