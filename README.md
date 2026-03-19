@@ -75,9 +75,11 @@
 - `python3`
 - 可选：Chrome / Chromium / Edge，用于浏览器侧探针
 
-## 用法
+## 快速开始
 
 ```bash
+git clone https://github.com/Liang-HZ/network-fingerprint-audit.git
+cd network-fingerprint-audit
 ./bin/audit-network
 ```
 
@@ -87,7 +89,13 @@
 - 生成报告到 `reports/`
 - 自动打开最新的 HTML 报告
 
-可选参数：
+如果你已经有本地仓库副本，直接在仓库根目录运行：
+
+```bash
+./bin/audit-network
+```
+
+## 常用参数
 
 ```bash
 ./bin/audit-network --skip-network
