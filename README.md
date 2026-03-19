@@ -28,8 +28,14 @@
 - 检查 `LANG`、`LC_ALL`、`AppleLanguages`、`AppleLocale`
 - 检查 Chrome / Chromium / Microsoft Edge 各 profile 的 `Accept-Language`
 - 启动临时 headless Chrome / Chromium / Edge，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC ICE 候选
-- 检查常见 Clash Verge / Mihomo 运行态配置快照
+- 额外扫描常见 Clash Verge / Mihomo 运行态配置快照
 - 自动生成中文 Markdown、结构化 HTML 和 JSON 报告
+
+## 兼容范围
+
+- 核心检测依赖 macOS 系统代理、DNS、路由、监听端口和浏览器探针，因此对大多数会影响这些信号的代理方案都适用。
+- 当前只有 Clash Verge / Mihomo 提供了额外的运行态配置快照和相关启发式判断。
+- 如果某个代理软件不写入系统代理、不走常见本地监听端口、或者使用完全不同的配置路径，系统层和浏览器层结果通常仍可见，但不会有该产品的专项诊断信息。
 
 ## 可靠性边界
 
@@ -125,7 +131,7 @@ cd network-fingerprint-audit
 - 顶部概览区，先看高 / 中 / 低风险分布
 - `主要发现` 用表格集中展示问题和证据
 - `修复建议` 给出按优先级排序的处理方向
-- `浏览器与 WebRTC`、`网络与区域信号`、`代理设置`、`Clash 快照` 分模块展示
+- `浏览器与 WebRTC`、`网络与区域信号`、`代理设置`、`代理运行态快照` 分模块展示
 
 这份布局优先服务排障，而不是展示炫技 UI。
 
@@ -147,7 +153,7 @@ cd network-fingerprint-audit
 ## 隐私与安全
 
 - 脚本只抓取排障相关字段
-- Clash 配置只保留去敏后的关键片段，不会整段写入订阅或 token
+- 当前内置的 Clash/Mihomo 配置快照只保留去敏后的关键片段，不会整段写入订阅或 token
 - 报告默认不再写入主机名、当前工作目录；家目录绝对路径会被脱敏成 `~`
 - 浏览器探针在本地临时目录运行，结束后清理 profile
 - 生成的报告保存在本地 `reports/`，不会自动上传

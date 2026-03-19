@@ -1228,7 +1228,7 @@ def render_markdown(data: dict[str, object]) -> str:
 
     clash = data.get("clash", {})
     if isinstance(clash, dict) and clash.get("configs"):
-        lines.extend(["", "## Clash 运行态快照", ""])
+        lines.extend(["", "## 代理运行态快照", ""])
         for config in clash["configs"]:
             if not isinstance(config, dict):
                 continue
@@ -1879,7 +1879,7 @@ def render_html(data: dict[str, object]) -> str:
         <a href="#browser"><span>浏览器与 WebRTC</span><span>{len(webrtc.get("candidates", []))}</span></a>
         <a href="#network"><span>网络与区域</span><span>{esc(", ".join((data.get("dns") or {}).get("nameservers", [])) or "未知")}</span></a>
         <a href="#proxy"><span>代理与路由</span><span>{esc((default_route or {}).get("interface"))}</span></a>
-        <a href="#clash"><span>Clash 快照</span><span>{len((data.get("clash") or {}).get("configs", []))}</span></a>
+        <a href="#clash"><span>代理快照</span><span>{len((data.get("clash") or {}).get("configs", []))}</span></a>
       </nav>
     </aside>
     <main>
@@ -2014,10 +2014,10 @@ def render_html(data: dict[str, object]) -> str:
 
       <section id="clash">
         <div class="section-head">
-          <h2>Clash 运行态快照</h2>
+          <h2>代理运行态快照</h2>
           <span>{len((data.get("clash") or {}).get("configs", []))} Files</span>
         </div>
-        {"".join(clash_details) or '<p class="empty">未发现可读的 Clash 运行态配置。</p>'}
+        {"".join(clash_details) or '<p class="empty">未发现可读的代理运行态配置。当前仅内置 Clash/Mihomo 路径扫描。</p>'}
       </section>
     </main>
   </div>
