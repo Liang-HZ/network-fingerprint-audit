@@ -1,18 +1,81 @@
-# network-fingerprint-audit
+# macos-network-fingerprint-audit
 
-一键审计 macOS 当前网络出口、DNS、代理、语言环境、浏览器语言信号，以及浏览器侧 WebRTC / Header 暴露情况，方便复用排查“链路一致性”和“浏览器侧暴露”问题。
+一个面向 macOS 的本地审计工具，用来检查“网络出口、DNS、代理、语言环境、浏览器语言信号、浏览器侧 WebRTC / Header 暴露”是否彼此一致。
+
+推荐把开源项目名定为 `macos-network-fingerprint-audit`。这个名字足够直白，能直接说明平台范围和用途，也便于别人通过关键词搜索到它。
+
+## 关于作者
+
+我是一个充满好奇心的 AI 应用从业者，关注 AI 产品、自动化工作流，以及把复杂系统整理成可实际落地的工具。
+
+- 联系方式：`shineagentic@duck.com`
+
+## 它解决什么问题
+
+很多“环境不一致”问题并不在单一代理节点，而是出在：
+
+- 系统 DNS 和实际出口不一致
+- 终端语言、系统语言、浏览器语言彼此打架
+- 浏览器 profile 还保留着旧的 `Accept-Language`
+- 浏览器侧 WebRTC 额外暴露了本地地址或另一条公网路径
+- 系统代理 / 自动代理发现让不同应用走了不同链路
+
+这个项目的目标不是“伪装指纹”，而是把这些信号收集到一份结构化报告里，方便排查、复查和做前后差异对比。
 
 ## 功能
 
 - 检查公网出口 IP、ASN、地理位置、时区
-- 检查系统 DNS、Wi‑Fi DNS、TUN/`utun` 路由、127.0.0.1:53/7890 监听
-- 检查系统代理、WPAD 自动代理发现
-- 检查 `LANG`、`AppleLanguages`、`AppleLocale`
-- 检查 Chrome/Chromium 各 profile 的 `Accept-Language`
-- 启动临时 headless Chrome/Chromium，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC ICE 候选
+- 检查系统 DNS、当前活跃网络服务 DNS、默认路由、`utun` 分流、127.0.0.1:53/7890 监听
+- 检查系统代理、自动代理 URL、WPAD 自动代理发现
+- 检查 `LANG`、`LC_ALL`、`AppleLanguages`、`AppleLocale`
+- 检查 Chrome / Chromium / Microsoft Edge 各 profile 的 `Accept-Language`
+- 启动临时 headless Chrome / Chromium / Edge，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC ICE 候选
 - 检查常见 Clash Verge / Mihomo 运行态配置快照
-- 基于结果自动生成优先级修复建议
-- 自动输出中文 Markdown、结构化 HTML 报告和 JSON 到 `reports/`
+- 自动生成中文 Markdown、结构化 HTML 和 JSON 报告
+
+## 可靠性边界
+
+这份工具适合开源，但应该被定位为“审计 / 诊断工具”，不是“结果保证工具”。
+
+### 相对可靠的部分
+
+这些结果来自系统命令或浏览器实测，可信度相对高：
+
+- `scutil --proxy`、`scutil --dns`、`route`、`netstat`、`networksetup`
+- `defaults read -g AppleLanguages`、`defaults read -g AppleLocale`
+- 本地浏览器 profile 配置文件中的 `Accept-Language`
+- headless 浏览器真实发出的请求头和 WebRTC ICE 候选
+
+### 启发式的部分
+
+这些判断是“提示”，不是绝对结论：
+
+- “Datacenter egress detected” 基于 ASN / 主机名关键词
+- “China-oriented public resolvers” 基于常见公共 DNS 列表
+- “locale signals include Chinese” 基于本地语言字段的组合判断
+- 修复建议本质上是经验规则，不代表唯一正确做法
+
+### 已知限制
+
+- 只支持 macOS；其他系统不会给出可信结果
+- 浏览器探针使用临时 headless profile，不等于完整复现你的日常浏览器
+- 浏览器探针依赖外网可访问；断网或严格拦截时只能拿到部分数据
+- 这不是反检测绕过工具，也不能证明某个目标站点一定“不会风控”
+
+## 最近做过的可靠性收口
+
+为开源前可用性做了几项关键修正：
+
+- 不再把 `networksetup` 查询硬编码到 `Wi-Fi`，而是优先跟随默认路由对应的活跃网络服务
+- 语言信号判断同时纳入 `LANG`、`LC_ALL`、`AppleLanguages`、`AppleLocale`
+- 增加 Microsoft Edge profile 语言扫描
+- 增加最小单元测试，覆盖网络服务解析和区域信号判断
+
+## 依赖
+
+- macOS 自带：`scutil`、`networksetup`、`route`、`netstat`、`defaults`
+- `python3`
+- 可选：Chrome / Chromium / Edge，用于浏览器侧探针
 
 ## 用法
 
@@ -20,7 +83,11 @@
 ./bin/audit-network
 ```
 
-默认行为是：生成报告后自动打开最新的 HTML 可视化页。
+默认行为：
+
+- 采集本机信号
+- 生成报告到 `reports/`
+- 自动打开最新的 HTML 报告
 
 可选参数：
 
@@ -34,36 +101,67 @@
 
 ## 输出
 
-运行后会生成：
+每次运行会生成：
 
 - `reports/audit-YYYYMMDD-HHMMSS.md`
 - `reports/audit-YYYYMMDD-HHMMSS.html`
 - `reports/audit-YYYYMMDD-HHMMSS.json`
 
-Markdown 适合快速看结论，HTML 适合像审计报告一样按模块浏览，JSON 适合后续接别的自动化。
+其中：
+
+- Markdown 适合快速看结论
+- HTML 适合按模块浏览和复查
+- JSON 适合做前后 diff 或接入别的自动化
 
 ## HTML 报告结构
 
-HTML 报告默认自动打开，采用偏“报告”而不是“展示页”的结构：
+- 左侧固定目录，便于在长报告里跳转
+- 顶部概览区，先看高 / 中 / 低风险分布
+- `主要发现` 用表格集中展示问题和证据
+- `修复建议` 给出按优先级排序的处理方向
+- `浏览器与 WebRTC`、`网络与区域信号`、`代理设置`、`Clash 快照` 分模块展示
 
-- 左侧固定目录，便于在长报告里快速跳转
-- 顶部概览区，先看高/中/低风险分布和摘要
-- `主要发现` 用表格集中展示问题和说明
-- `修复建议` 按优先级拆开，方便照着处理
-- `浏览器与 WebRTC`、`网络与区域信号`、`代理设置`、`Clash 快照` 分模块展开
+这份布局优先服务排障，而不是展示炫技 UI。
 
-这份布局更适合排障、复查和对比，不需要在很多卡片里来回找信息。
+## 如何理解结果
 
-## 依赖
+- `高风险`：更可能导致“出口和环境看起来不像同一台机器/同一类用户”
+- `中风险`：存在明显不一致，但未必单独触发问题
+- `低风险`：会增加复杂性或不确定性
+- `信息`：主要用于补全上下文，不一定需要处理
 
-- macOS 自带：`scutil`、`networksetup`、`route`、`netstat`、`defaults`
-- `python3`
-- 可选：本机安装的 Chrome / Chromium / Edge，用于浏览器侧探针
+比较推荐的用法是：
 
-## 说明
+1. 修改一个变量，例如 DNS、代理或浏览器语言
+2. 重新运行审计
+3. 对比前后两份 JSON 报告
 
-- 脚本只抓取审计相关信号，避免把代理订阅、token 等敏感配置整段写入报告。
-- 如果你主要用浏览器访问目标服务，重点看 Browser Languages、Public Egress、DNS、Proxy Setup。
-- 如果你主要用 CLI / IDE 插件，重点看 `LANG`、系统时区、代理链路、出口 ASN。
-- 浏览器侧探针通过本地临时页面复现网页检测站常用的思路：直接在浏览器里调用 `RTCPeerConnection` 和 `fetch`，所以它可以看到 WebRTC ICE 候选和浏览器真正发出的语言头。
-- 浏览器侧探针使用临时 headless profile，适合排查链路和暴露面，不等同于完整模拟你日常浏览器的全部反爬指纹。
+这样比只看单次结果更有价值。
+
+## 隐私与安全
+
+- 脚本只抓取排障相关字段
+- Clash 配置只保留去敏后的关键片段，不会整段写入订阅或 token
+- 报告默认不再写入主机名、当前工作目录；家目录绝对路径会被脱敏成 `~`
+- 浏览器探针在本地临时目录运行，结束后清理 profile
+- 生成的报告保存在本地 `reports/`，不会自动上传
+- `reports/` 已被 `.gitignore` 忽略，不建议把生成报告公开发布
+
+## 验证
+
+当前仓库至少应通过：
+
+```bash
+python3 -m py_compile network_audit.py
+python3 -m unittest discover -s tests -v
+python3 network_audit.py --no-open
+python3 network_audit.py --skip-network --no-open
+python3 network_audit.py --skip-browser-probe --no-open
+```
+
+## 不在本项目目标内的内容
+
+- 不承诺“修复后一切站点都通过”
+- 不负责伪造完整浏览器指纹
+- 不尝试绕过站点风控策略
+- 不替代代理、DNS 或浏览器本身的正确配置

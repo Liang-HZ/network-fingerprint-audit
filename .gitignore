@@ -1,6 +1,4 @@
 __pycache__/
 *.pyc
-reports/*.json
-reports/*.md
-reports/*.html
-!.gitkeep
+reports/*
+!reports/.gitkeep

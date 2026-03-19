@@ -12,7 +12,6 @@ import json
 import os
 import pathlib
 import re
-import socket
 import subprocess
 import sys
 import tempfile
@@ -72,6 +71,20 @@ def run_command(*args: str, timeout: int = 5) -> dict[str, object]:
         return {"cmd": list(args), "code": None, "stdout": "", "stderr": "timeout"}
 
 
+def skipped_command_result(*args: str, reason: str) -> dict[str, object]:
+    return {"cmd": list(args), "code": None, "stdout": "", "stderr": reason}
+
+
+def redact_user_path(path: pathlib.Path | str) -> str:
+    raw = str(path)
+    home = str(pathlib.Path.home())
+    if raw == home:
+        return "~"
+    if raw.startswith(home + os.sep):
+        return "~" + raw[len(home) :]
+    return raw
+
+
 def fetch_json(url: str, timeout: int = 5) -> dict[str, object] | None:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -121,6 +134,79 @@ def parse_dns_nameservers(raw: str) -> list[str]:
 
 def parse_default_route(raw: str) -> dict[str, str]:
     return parse_key_value_block(raw)
+
+
+def parse_enabled_network_services(raw: str) -> list[str]:
+    services: list[str] = []
+    for line in raw.splitlines():
+        service = line.strip()
+        if not service or service.startswith("An asterisk"):
+            continue
+        if service.startswith("*"):
+            continue
+        services.append(service)
+    return services
+
+
+def parse_network_service_order(raw: str) -> list[dict[str, object]]:
+    services: list[dict[str, object]] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("An asterisk"):
+            continue
+        service_match = re.match(r"^\(\d+\)\s+(.+)$", stripped)
+        if service_match:
+            name = service_match.group(1).strip()
+            enabled = True
+            if name.startswith("*"):
+                enabled = False
+                name = name[1:].strip()
+            services.append({"service": name, "enabled": enabled})
+            continue
+        device_match = re.match(r"^\(Hardware Port:\s*(.+?),\s*Device:\s*(.+?)\)$", stripped)
+        if device_match and services:
+            services[-1]["hardware_port"] = device_match.group(1).strip()
+            services[-1]["device"] = device_match.group(2).strip()
+    return services
+
+
+def choose_active_network_service(
+    default_interface: str | None,
+    service_order: list[dict[str, object]],
+    enabled_services: list[str],
+) -> dict[str, str | None]:
+    if default_interface:
+        for item in service_order:
+            if str(item.get("device") or "") == default_interface and item.get("enabled", True):
+                return {
+                    "service": str(item.get("service") or ""),
+                    "interface": default_interface,
+                    "source": "default-route",
+                }
+
+    if "Wi-Fi" in enabled_services:
+        return {
+            "service": "Wi-Fi",
+            "interface": default_interface or None,
+            "source": "fallback-wifi",
+        }
+
+    if enabled_services:
+        return {
+            "service": enabled_services[0],
+            "interface": default_interface or None,
+            "source": "fallback-enabled-service",
+        }
+
+    for item in service_order:
+        if item.get("enabled", True) and item.get("service"):
+            return {
+                "service": str(item.get("service") or ""),
+                "interface": str(item.get("device") or default_interface or ""),
+                "source": "fallback-service-order",
+            }
+
+    return {"service": None, "interface": default_interface or None, "source": "unavailable"}
 
 
 def parse_split_tunnel_routes(raw: str) -> list[dict[str, str]]:
@@ -243,7 +329,7 @@ def sanitize_clash_excerpt(path: pathlib.Path) -> dict[str, object] | None:
 
     if not excerpt:
         return None
-    return {"path": str(path), "excerpt": excerpt}
+    return {"path": redact_user_path(path), "excerpt": excerpt}
 
 
 def get_case_insensitive(mapping: object, key: str) -> str | None:
@@ -268,6 +354,20 @@ def candidate_address_scope(address: str) -> str:
     if parsed.is_private or parsed.is_loopback or parsed.is_link_local:
         return "private"
     return "public"
+
+
+def locale_signals_include_chinese(locale_data: dict[str, object]) -> bool:
+    for key in ("lang", "lc_all", "apple_locale"):
+        value = str(locale_data.get(key) or "").strip().lower()
+        if value.startswith("zh"):
+            return True
+
+    apple_languages = locale_data.get("apple_languages") or []
+    if isinstance(apple_languages, list):
+        for item in apple_languages:
+            if str(item).strip().lower().startswith("zh"):
+                return True
+    return False
 
 
 def first_language_tag(value: str | None) -> str | None:
@@ -487,17 +587,18 @@ def make_findings(data: dict[str, object]) -> list[dict[str, str]]:
             )
 
     env = data.get("locale", {})
-    if isinstance(env, dict):
+    if isinstance(env, dict) and locale_signals_include_chinese(env):
         lang = str(env.get("lang") or "")
+        lc_all = str(env.get("lc_all") or "")
         apple_languages = env.get("apple_languages") or []
-        if "zh_CN" in lang or any(str(item).lower().startswith("zh") for item in apple_languages):
-            findings.append(
-                {
-                    "severity": "medium",
-                    "title": "Local language signals include Chinese",
-                    "detail": f"LANG={lang or 'unset'}; AppleLanguages={apple_languages}.",
-                }
-            )
+        apple_locale = str(env.get("apple_locale") or "")
+        findings.append(
+            {
+                "severity": "medium",
+                "title": "Local language signals include Chinese",
+                "detail": f"LANG={lang or 'unset'}; LC_ALL={lc_all or 'unset'}; AppleLanguages={apple_languages}; AppleLocale={apple_locale or 'unset'}.",
+            }
+        )
 
     browsers = data.get("browser_languages", [])
     if isinstance(browsers, list):
@@ -640,7 +741,7 @@ def build_recommendations(data: dict[str, object]) -> list[dict[str, str]]:
             {
                 "priority": "P1",
                 "area": "DNS Consistency",
-                "action": "Reset Wi-Fi DNS to Automatic or point it to your local proxy-managed DNS path so it does not advertise mainland public resolvers.",
+                "action": "Reset the active macOS network service DNS to Automatic or point it to your local proxy-managed DNS path so it does not advertise mainland public resolvers.",
                 "why": "Even when DNS is intercepted later, mismatched resolver settings are an avoidable inconsistency.",
             }
         )
@@ -712,15 +813,36 @@ def collect_data(
     routes_raw = run_command("netstat", "-rn", "-f", "inet")
     tcp_raw = run_command("netstat", "-anv", "-p", "tcp")
     udp_raw = run_command("netstat", "-anv", "-p", "udp")
-    wifi_dns_raw = run_command("networksetup", "-getdnsservers", "Wi-Fi")
-    wifi_webproxy_raw = run_command("networksetup", "-getwebproxy", "Wi-Fi")
-    wifi_secureproxy_raw = run_command("networksetup", "-getsecurewebproxy", "Wi-Fi")
-    wifi_socks_raw = run_command("networksetup", "-getsocksfirewallproxy", "Wi-Fi")
-    wifi_autoproxy_raw = run_command("networksetup", "-getautoproxyurl", "Wi-Fi")
-    wifi_discovery_raw = run_command("networksetup", "-getproxyautodiscovery", "Wi-Fi")
+    network_service_order_raw = run_command("networksetup", "-listnetworkserviceorder")
+    network_services_raw = run_command("networksetup", "-listallnetworkservices")
     apple_languages_raw = run_command("defaults", "read", "-g", "AppleLanguages")
     apple_locale_raw = run_command("defaults", "read", "-g", "AppleLocale")
     nwi_raw = run_command("scutil", "--nwi")
+
+    default_route = parse_default_route(str(route_raw.get("stdout", "")))
+    active_network = choose_active_network_service(
+        default_route.get("interface"),
+        parse_network_service_order(str(network_service_order_raw.get("stdout", ""))),
+        parse_enabled_network_services(str(network_services_raw.get("stdout", ""))),
+    )
+    active_service = str(active_network.get("service") or "")
+
+    def run_networksetup_for_service(flag: str) -> dict[str, object]:
+        if not active_service:
+            return skipped_command_result(
+                "networksetup",
+                flag,
+                "<active-network-service>",
+                reason="could not determine an active macOS network service",
+            )
+        return run_command("networksetup", flag, active_service)
+
+    wifi_dns_raw = run_networksetup_for_service("-getdnsservers")
+    wifi_webproxy_raw = run_networksetup_for_service("-getwebproxy")
+    wifi_secureproxy_raw = run_networksetup_for_service("-getsecurewebproxy")
+    wifi_socks_raw = run_networksetup_for_service("-getsocksfirewallproxy")
+    wifi_autoproxy_raw = run_networksetup_for_service("-getautoproxyurl")
+    wifi_discovery_raw = run_networksetup_for_service("-getproxyautodiscovery")
 
     public_ip: dict[str, object] = {}
     if not skip_network:
@@ -738,6 +860,7 @@ def collect_data(
     for browser_name, base_path in (
         ("Chrome", pathlib.Path.home() / "Library/Application Support/Google/Chrome"),
         ("Chromium", pathlib.Path.home() / "Library/Application Support/Chromium"),
+        ("Microsoft Edge", pathlib.Path.home() / "Library/Application Support/Microsoft Edge"),
     ):
         if base_path.exists():
             browser_languages.append(extract_browser_languages(base_path, browser_name))
@@ -755,9 +878,8 @@ def collect_data(
     data: dict[str, object] = {
         "generated_at": now.isoformat(),
         "host": {
-            "hostname": socket.gethostname(),
             "platform": sys.platform,
-            "cwd": str(pathlib.Path.cwd()),
+            "project_root": PROJECT_ROOT.name,
         },
         "public_ip": public_ip,
         "proxy": parse_proxy_settings(str(proxy_raw.get("stdout", ""))),
@@ -767,9 +889,10 @@ def collect_data(
             "nwi": str(nwi_raw.get("stdout", "")),
         },
         "route": {
-            "default": parse_default_route(str(route_raw.get("stdout", ""))),
+            "default": default_route,
             "split_tunnel_routes": parse_split_tunnel_routes(str(routes_raw.get("stdout", ""))),
         },
+        "active_network": active_network,
         "listeners": parse_listener_summary(
             str(tcp_raw.get("stdout", "")),
             str(udp_raw.get("stdout", "")),
@@ -785,6 +908,7 @@ def collect_data(
         "browser_languages": browser_languages,
         "browser_probe": browser_probe,
         "networksetup": {
+            "service": active_service,
             "web_proxy": parse_key_value_block(str(wifi_webproxy_raw.get("stdout", ""))),
             "secure_web_proxy": parse_key_value_block(str(wifi_secureproxy_raw.get("stdout", ""))),
             "socks_proxy": parse_key_value_block(str(wifi_socks_raw.get("stdout", ""))),
@@ -799,6 +923,8 @@ def collect_data(
             "routes": routes_raw,
             "tcp": tcp_raw,
             "udp": udp_raw,
+            "network_service_order": network_service_order_raw,
+            "network_services": network_services_raw,
         },
     }
     data["findings"] = make_findings(data)
@@ -945,7 +1071,8 @@ def render_markdown(data: dict[str, object]) -> str:
         "# 网络环境指纹审计报告",
         "",
         f"- 生成时间：{data.get('generated_at')}",
-        f"- 主机名：{host.get('hostname')}",
+        f"- 平台：{host.get('platform')}",
+        f"- 项目：{host.get('project_root')}",
         "",
         "## 主要发现",
         "",
@@ -994,7 +1121,7 @@ def render_markdown(data: dict[str, object]) -> str:
                 "## DNS 信号",
                 "",
                 f"- `scutil --dns` 解析器：{', '.join(dns.get('nameservers', [])) or '无'}",
-                f"- Wi-Fi DNS：{dns.get('wifi_dns_raw') or '未知'}",
+                f"- 当前网络服务 DNS：{dns.get('wifi_dns_raw') or '未知'}",
                 f"- NWI 摘要：`{str(dns.get('nwi', '')).replace(chr(10), ' | ')}`",
             ]
         )
@@ -1007,9 +1134,23 @@ def render_markdown(data: dict[str, object]) -> str:
                 "## 语言与区域",
                 "",
                 f"- LANG：{locale.get('lang') or '未设置'}",
+                f"- LC_ALL：{locale.get('lc_all') or '未设置'}",
                 f"- AppleLanguages：{locale.get('apple_languages') or []}",
                 f"- AppleLocale：{locale.get('apple_locale') or '未知'}",
                 f"- 本地时间：{locale.get('timestamp') or '未知'}",
+            ]
+        )
+
+    active_network = data.get("active_network", {})
+    if isinstance(active_network, dict):
+        lines.extend(
+            [
+                "",
+                "## 当前活跃网络服务",
+                "",
+                f"- 服务名：{active_network.get('service') or '未知'}",
+                f"- 接口：{active_network.get('interface') or '未知'}",
+                f"- 识别来源：{active_network.get('source') or '未知'}",
             ]
         )
 
@@ -1251,9 +1392,12 @@ def render_html(data: dict[str, object]) -> str:
         ["ASN / 组织", esc(ipinfo.get("org") or ifconfig.get("asn_org"))],
         ["位置", esc(f"{ipinfo.get('city') or ifconfig.get('city') or '未知'}，{ipinfo.get('region') or ifconfig.get('region_name') or ''} {ipinfo.get('country') or ifconfig.get('country_iso') or ''}")],
         ["时区", esc(ipinfo.get("timezone") or ifconfig.get("time_zone"))],
+        ["活跃网络服务", esc((data.get("active_network") or {}).get("service"))],
+        ["活跃接口", esc((data.get("active_network") or {}).get("interface"))],
         ["系统 DNS", esc(", ".join((data.get("dns") or {}).get("nameservers", [])))],
-        ["Wi‑Fi DNS", esc((data.get("dns") or {}).get("wifi_dns_raw"))],
+        ["当前网络服务 DNS", esc((data.get("dns") or {}).get("wifi_dns_raw"))],
         ["LANG", esc((data.get("locale") or {}).get("lang"))],
+        ["LC_ALL", esc((data.get("locale") or {}).get("lc_all"))],
         ["AppleLanguages", esc((data.get("locale") or {}).get("apple_languages"))],
         ["AppleLocale", esc((data.get("locale") or {}).get("apple_locale"))],
         ["本地时间", esc((data.get("locale") or {}).get("timestamp"))],
@@ -1723,7 +1867,8 @@ def render_html(data: dict[str, object]) -> str:
       <p class="sidebar-copy">参考 NodeSecure/report 这类“结构化报告”的阅读方式重做，重点是目录、概览、表格和模块化信息密度。</p>
       <div class="sidebar-meta">
         <div><label>生成时间</label><span>{esc(data.get("generated_at"))}</span></div>
-        <div><label>主机名</label><span>{esc((data.get("host") or {}).get("hostname"))}</span></div>
+        <div><label>平台</label><span>{esc((data.get("host") or {}).get("platform"))}</span></div>
+        <div><label>项目</label><span>{esc((data.get("host") or {}).get("project_root"))}</span></div>
         <div><label>公网出口</label><span>{esc(ipinfo.get("ip") or ifconfig.get("ip"))}</span></div>
         <div><label>浏览器探针</label><span>{html.escape(probe_status_label(str(browser_probe.get("status") or "")))}</span></div>
       </div>
@@ -1936,6 +2081,10 @@ def main() -> int:
         help="Generate reports but do not automatically open the HTML report.",
     )
     args = parser.parse_args()
+
+    if sys.platform != "darwin":
+        print("This tool currently supports macOS only.", file=sys.stderr)
+        return 2
 
     data = collect_data(
         skip_network=args.skip_network,
