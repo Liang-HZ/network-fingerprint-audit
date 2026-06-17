@@ -1,6 +1,6 @@
-# macos-network-fingerprint-audit
+# network-fingerprint-audit
 
-一个面向 macOS 的本地审计工具，用来检查“网络出口、DNS、代理、语言环境、浏览器语言信号、浏览器侧 WebRTC / Header 暴露”是否彼此一致。
+一个面向 macOS / Windows 的本地审计工具，用来检查“网络出口、DNS、代理、语言环境、浏览器语言信号、浏览器侧 WebRTC / Header 暴露”是否彼此一致。
 
 ## 关于作者
 
@@ -22,20 +22,21 @@
 
 ## 功能
 
-- 检查公网出口 IP、ASN、地理位置、时区
-- 检查系统 DNS、当前活跃网络服务 DNS、默认路由、`utun` 分流、127.0.0.1:53/7890 监听
+- 检查公网出口 IP、ASN、地理位置、时区，并融合 ipapi.is / proxycheck.io / Cloudflare trace 等外部观测
+- 检查系统 DNS、当前活跃网络服务 DNS、默认路由、macOS `utun` / Windows 路由与监听端口、127.0.0.1:53/7890 监听
 - 检查系统代理、自动代理 URL、WPAD 自动代理发现
 - 检查 `LANG`、`LC_ALL`、`AppleLanguages`、`AppleLocale`
 - 检查 Chrome / Chromium / Microsoft Edge 各 profile 的 `Accept-Language`
-- 启动临时 headless Chrome / Chromium / Edge，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC ICE 候选
-- 额外扫描常见 Clash Verge / Mihomo 运行态配置快照
+- 启动临时 headless Chrome / Chromium / Edge，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC 地址暴露
+- 额外识别常见代理客户端进程 / 配置路径，并对 Clash Verge / Mihomo 等可读配置生成去敏摘要
 - 自动生成中文 Markdown、结构化 HTML 和 JSON 报告
 
 ## 兼容范围
 
-- 核心检测依赖 macOS 系统代理、DNS、路由、监听端口和浏览器探针，因此对大多数会影响这些信号的代理方案都适用。
-- 当前只有 Clash Verge / Mihomo 提供了额外的运行态配置快照和相关启发式判断。
-- 如果某个代理软件不写入系统代理、不走常见本地监听端口、或者使用完全不同的配置路径，系统层和浏览器层结果通常仍可见，但不会有该产品的专项诊断信息。
+- 核心检测依赖系统代理、DNS、路由、监听端口和浏览器探针，因此对大多数会影响这些信号的代理方案都适用。
+- 核心审计不绑定具体客户端：Clash/Mihomo、Surge、sing-box、V2Ray、Shadowsocks、Outline、Hiddify 等只要影响系统代理、TUN/VPN、DNS、路由、出口或浏览器，就会反映在通用检测结果里。
+- 当前会额外识别常见客户端的进程和配置路径；Clash Verge / Mihomo 等可读配置会提供去敏摘要，其他客户端先以“线索识别”为主，不强行读取订阅、节点或密钥内容。
+- 如果某个代理软件不写入系统代理、不走常见本地监听端口、只在单个 App 内手动配置，系统层和浏览器层结果可能仍可见，但不会保证能识别该客户端内部配置。
 
 ## 可靠性边界
 
@@ -48,20 +49,20 @@
 - `scutil --proxy`、`scutil --dns`、`route`、`netstat`、`networksetup`
 - `defaults read -g AppleLanguages`、`defaults read -g AppleLocale`
 - 本地浏览器 profile 配置文件中的 `Accept-Language`
-- headless 浏览器真实发出的请求头和 WebRTC ICE 候选
+- headless 浏览器真实发出的请求头和 WebRTC 地址暴露
 
 ### 启发式的部分
 
 这些判断是“提示”，不是绝对结论：
 
-- “Datacenter egress detected” 基于 ASN / 主机名关键词
+- “Datacenter egress detected” 优先基于 ipapi.is / proxycheck.io 的结构化风险字段；只有外部情报不可用时才退回 ASN / 主机名关键词
 - “China-oriented public resolvers” 基于常见公共 DNS 列表
 - “locale signals include Chinese” 基于本地语言字段的组合判断
 - 修复建议本质上是经验规则，不代表唯一正确做法
 
 ### 已知限制
 
-- 只支持 macOS；其他系统不会给出可信结果
+- 支持 macOS 和 Windows；Linux 暂不支持
 - 浏览器探针使用临时 headless profile，不等于完整复现你的日常浏览器
 - 浏览器探针依赖外网可访问；断网或严格拦截时只能拿到部分数据
 - 这不是反检测绕过工具，也不能证明某个目标站点一定“不会风控”
@@ -71,6 +72,7 @@
 当前实现包含几项关键的稳健性处理：
 
 - 不再把 `networksetup` 查询硬编码到 `Wi-Fi`，而是优先跟随默认路由对应的活跃网络服务
+- 出口风险不再只靠 ASN 关键词，新增 ipapi.is 和 proxycheck.io 两类外部情报源，并保留 Cloudflare trace 作为独立观测
 - 语言信号判断同时纳入 `LANG`、`LC_ALL`、`AppleLanguages`、`AppleLocale`
 - 增加 Microsoft Edge profile 语言扫描
 - 增加最小单元测试，覆盖网络服务解析和区域信号判断
@@ -78,6 +80,7 @@
 ## 依赖
 
 - macOS 自带：`scutil`、`networksetup`、`route`、`netstat`、`defaults`
+- Windows 自带：`ipconfig`、`route`、`netstat`、`netsh`、`reg`、`powershell`、`tzutil`
 - `python3`
 - 可选：Chrome / Chromium / Edge，用于浏览器侧探针
 
@@ -153,7 +156,7 @@ cd network-fingerprint-audit
 ## 隐私与安全
 
 - 脚本只抓取排障相关字段
-- 当前内置的 Clash/Mihomo 配置快照只保留去敏后的关键片段，不会整段写入订阅或 token
+- 当前内置的代理客户端识别只保留进程名、配置路径和去敏后的关键片段，不会整段写入订阅或 token
 - 报告默认不再写入主机名、当前工作目录；家目录绝对路径会被脱敏成 `~`
 - 浏览器探针在本地临时目录运行，结束后清理 profile
 - 生成的报告保存在本地 `reports/`，不会自动上传

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -43,7 +44,70 @@ CLASH_CONFIG_CANDIDATES = [
     pathlib.Path.home() / ".config/clash.meta/config.yaml",
 ]
 
-BROWSER_CANDIDATES = [
+PROXY_CLIENT_SIGNATURES = [
+    {
+        "name": "Clash/Mihomo",
+        "process_keywords": ("clash", "mihomo"),
+        "config_paths": tuple(CLASH_CONFIG_CANDIDATES),
+    },
+    {
+        "name": "Surge",
+        "process_keywords": ("surge",),
+        "config_paths": (
+            pathlib.Path.home() / "Library/Application Support/Surge",
+            pathlib.Path.home() / "Library/Mobile Documents/iCloud~com~nssurge~inc~surge/Documents",
+            pathlib.Path.home() / "AppData/Roaming/Surge",
+        ),
+    },
+    {
+        "name": "sing-box",
+        "process_keywords": ("sing-box", "sfm", "sfi"),
+        "config_paths": (
+            pathlib.Path.home() / ".config/sing-box",
+            pathlib.Path.home() / "Library/Application Support/io.nekohasekai.sfavt",
+            pathlib.Path.home() / "AppData/Roaming/sing-box",
+            pathlib.Path.home() / "AppData/Local/sing-box",
+        ),
+    },
+    {
+        "name": "V2Ray/v2rayN",
+        "process_keywords": ("v2rayx", "v2rayu", "v2ray"),
+        "config_paths": (
+            pathlib.Path.home() / "Library/Application Support/V2RayX",
+            pathlib.Path.home() / "Library/Application Support/V2RayU",
+            pathlib.Path.home() / ".config/v2ray",
+            pathlib.Path.home() / "AppData/Roaming/v2rayN",
+            pathlib.Path.home() / "AppData/Roaming/v2ray",
+        ),
+    },
+    {
+        "name": "Shadowsocks",
+        "process_keywords": ("shadowsocks", "ss-local"),
+        "config_paths": (
+            pathlib.Path.home() / "Library/Application Support/ShadowsocksX-NG",
+            pathlib.Path.home() / ".ShadowsocksX-NG",
+            pathlib.Path.home() / "AppData/Roaming/Shadowsocks",
+        ),
+    },
+    {
+        "name": "Outline",
+        "process_keywords": ("outline",),
+        "config_paths": (
+            pathlib.Path.home() / "Library/Application Support/Outline",
+            pathlib.Path.home() / "AppData/Roaming/Outline",
+        ),
+    },
+    {
+        "name": "Hiddify",
+        "process_keywords": ("hiddify",),
+        "config_paths": (
+            pathlib.Path.home() / "Library/Application Support/Hiddify",
+            pathlib.Path.home() / "AppData/Roaming/Hiddify",
+        ),
+    },
+]
+
+MACOS_BROWSER_CANDIDATES = [
     pathlib.Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
     pathlib.Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
     pathlib.Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
@@ -102,6 +166,32 @@ def fetch_text(url: str, timeout: int = 5) -> str | None:
         return None
 
 
+def parse_cloudflare_trace(raw: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in raw.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            parsed[key] = value.strip()
+    return parsed
+
+
+def fetch_proxycheck(ip: str, timeout: int = 5) -> dict[str, object] | None:
+    if not ip:
+        return None
+    encoded_ip = urllib.parse.quote(ip, safe="")
+    payload = fetch_json(
+        f"https://proxycheck.io/v2/{encoded_ip}?vpn=1&asn=1&risk=1",
+        timeout=timeout,
+    )
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return None
+    result = payload.get(ip)
+    return result if isinstance(result, dict) else None
+
+
 def parse_key_value_block(text: str) -> dict[str, str]:
     parsed: dict[str, str] = {}
     for line in text.splitlines():
@@ -110,6 +200,31 @@ def parse_key_value_block(text: str) -> dict[str, str]:
         key, value = line.split(":", 1)
         parsed[key.strip()] = value.strip()
     return parsed
+
+
+def command_stdout(result: dict[str, object]) -> str:
+    return str(result.get("stdout", "")).strip()
+
+
+def command_failed(result: dict[str, object]) -> bool:
+    return result.get("code") != 0
+
+
+def command_failure_notes(
+    raw_command_status: dict[str, dict[str, object]],
+    required_keys: tuple[str, ...],
+) -> list[str]:
+    notes: list[str] = []
+    for key in required_keys:
+        result = raw_command_status[key]
+        if not command_failed(result):
+            continue
+        cmd = " ".join(str(part) for part in result.get("cmd", []))
+        stderr = command_stdout({"stdout": result.get("stderr", "")})
+        code = result.get("code")
+        reason = stderr or f"exit code {code}"
+        notes.append(f"{key}: {cmd} failed ({reason})")
+    return notes
 
 
 def parse_proxy_settings(raw: str) -> dict[str, object]:
@@ -188,14 +303,14 @@ def choose_active_network_service(
         return {
             "service": "Wi-Fi",
             "interface": default_interface or None,
-            "source": "fallback-wifi",
+            "source": "heuristic-wifi",
         }
 
     if enabled_services:
         return {
             "service": enabled_services[0],
             "interface": default_interface or None,
-            "source": "fallback-enabled-service",
+            "source": "heuristic-enabled-service",
         }
 
     for item in service_order:
@@ -203,7 +318,7 @@ def choose_active_network_service(
             return {
                 "service": str(item.get("service") or ""),
                 "interface": str(item.get("device") or default_interface or ""),
-                "source": "fallback-service-order",
+                "source": "heuristic-service-order",
             }
 
     return {"service": None, "interface": default_interface or None, "source": "unavailable"}
@@ -237,14 +352,37 @@ def parse_listener_summary(tcp_raw: str, udp_raw: str) -> dict[str, bool]:
         "tcp_127_0_0_1_7890": False,
     }
     for line in tcp_raw.splitlines():
-        if "127.0.0.1.53" in line and "LISTEN" in line:
+        if ("127.0.0.1.53" in line or "127.0.0.1:53" in line) and "LISTEN" in line:
             summary["tcp_127_0_0_1_53"] = True
-        if "127.0.0.1.7890" in line and "LISTEN" in line:
+        if ("127.0.0.1.7890" in line or "127.0.0.1:7890" in line) and "LISTEN" in line:
             summary["tcp_127_0_0_1_7890"] = True
     for line in udp_raw.splitlines():
-        if "127.0.0.1.53" in line:
+        if "127.0.0.1.53" in line or "127.0.0.1:53" in line:
             summary["udp_127_0_0_1_53"] = True
     return summary
+
+
+def parse_windows_ipconfig_dns(raw: str) -> list[str]:
+    nameservers: list[str] = []
+    collecting_dns = False
+    for line in raw.splitlines():
+        if "DNS Servers" in line and ":" in line:
+            collecting_dns = True
+            value = line.split(":", 1)[1].strip()
+        elif collecting_dns and line.startswith(" " * 20):
+            value = line.strip()
+        else:
+            collecting_dns = False
+            value = ""
+        if not value:
+            continue
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        if value not in nameservers:
+            nameservers.append(value)
+    return nameservers
 
 
 def parse_defaults_array(raw: str) -> list[str]:
@@ -332,6 +470,72 @@ def sanitize_clash_excerpt(path: pathlib.Path) -> dict[str, object] | None:
     return {"path": redact_user_path(path), "excerpt": excerpt}
 
 
+def process_display_name(command: str) -> str:
+    if "\\" in command or re.match(r"^[A-Za-z]:", command):
+        name = pathlib.PureWindowsPath(command).name
+    else:
+        name = pathlib.Path(command).name
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
+    if name.endswith(".app"):
+        return name[:-4]
+    return name or command
+
+
+def parse_process_command(line: str) -> str:
+    windows_exe = re.match(r"^([A-Za-z]:\\.*?\.exe)(?:\s|$)", line, re.IGNORECASE)
+    if windows_exe:
+        return windows_exe.group(1)
+    return line.split(None, 1)[0]
+
+
+def parse_process_display_names(raw: str, keywords: tuple[str, ...]) -> list[str]:
+    matches: list[str] = []
+    lowered_keywords = tuple(keyword.lower() for keyword in keywords)
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if not any(keyword in lowered for keyword in lowered_keywords):
+            continue
+        command = parse_process_command(stripped)
+        display = process_display_name(command)
+        if display not in matches:
+            matches.append(display)
+    return matches
+
+
+def detect_proxy_clients(process_raw: str) -> list[dict[str, object]]:
+    clients: list[dict[str, object]] = []
+    for signature in PROXY_CLIENT_SIGNATURES:
+        name = str(signature["name"])
+        processes = parse_process_display_names(
+            process_raw,
+            tuple(str(item) for item in signature["process_keywords"]),
+        )
+        existing_paths: list[str] = []
+        configs: list[dict[str, object]] = []
+        for raw_path in signature["config_paths"]:
+            path = pathlib.Path(raw_path)
+            if not path.exists():
+                continue
+            existing_paths.append(redact_user_path(path))
+            excerpt = sanitize_clash_excerpt(path) if path.is_file() else None
+            if excerpt:
+                configs.append(excerpt)
+        if processes or existing_paths:
+            clients.append(
+                {
+                    "name": name,
+                    "processes": processes,
+                    "paths": existing_paths,
+                    "configs": configs,
+                }
+            )
+    return clients
+
+
 def get_case_insensitive(mapping: object, key: str) -> str | None:
     if not isinstance(mapping, dict):
         return None
@@ -340,6 +544,14 @@ def get_case_insensitive(mapping: object, key: str) -> str | None:
         if str(current_key).lower() == target:
             return str(value)
     return None
+
+
+def truthy_external_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
 
 
 def candidate_address_scope(address: str) -> str:
@@ -377,6 +589,68 @@ def first_language_tag(value: str | None) -> str | None:
     return first or None
 
 
+def public_ip_candidates(public_ip: dict[str, object]) -> list[str]:
+    candidates: list[str] = []
+
+    def add(value: object) -> None:
+        ip = str(value or "").strip()
+        if ip and ip not in candidates:
+            candidates.append(ip)
+
+    for source_name in ("ipapi_is", "ipinfo", "ifconfig"):
+        source = public_ip.get(source_name)
+        if isinstance(source, dict):
+            add(source.get("ip"))
+
+    cloudflare_trace = public_ip.get("cloudflare_trace_parsed")
+    if isinstance(cloudflare_trace, dict):
+        add(cloudflare_trace.get("ip"))
+
+    return candidates
+
+
+def nested_mapping(source: object, key: str) -> dict[str, object]:
+    if not isinstance(source, dict):
+        return {}
+    value = source.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def public_ip_summary(public_ip: dict[str, object]) -> dict[str, object]:
+    ipapi = public_ip.get("ipapi_is") if isinstance(public_ip.get("ipapi_is"), dict) else {}
+    ipinfo = public_ip.get("ipinfo") if isinstance(public_ip.get("ipinfo"), dict) else {}
+    ifconfig = public_ip.get("ifconfig") if isinstance(public_ip.get("ifconfig"), dict) else {}
+    proxycheck = (
+        public_ip.get("proxycheck") if isinstance(public_ip.get("proxycheck"), dict) else {}
+    )
+    ipapi_asn = nested_mapping(ipapi, "asn")
+    ipapi_location = nested_mapping(ipapi, "location")
+
+    return {
+        "ip": ipapi.get("ip") or ipinfo.get("ip") or ifconfig.get("ip"),
+        "observed_ips": public_ip.get("observed_ips", []),
+        "asn_org": ipapi_asn.get("org") or ipinfo.get("org") or ifconfig.get("asn_org"),
+        "city": ipapi_location.get("city") or ipinfo.get("city") or ifconfig.get("city"),
+        "region": ipapi_location.get("state")
+        or ipinfo.get("region")
+        or ifconfig.get("region_name"),
+        "country": ipapi_location.get("country_code")
+        or ipinfo.get("country")
+        or ifconfig.get("country_iso"),
+        "timezone": ipapi_location.get("timezone")
+        or ipinfo.get("timezone")
+        or ifconfig.get("time_zone"),
+        "ipapi_flags": {
+            key: ipapi.get(key)
+            for key in ("is_datacenter", "is_proxy", "is_vpn", "is_tor", "is_abuser")
+        },
+        "proxycheck_flags": {
+            key: proxycheck.get(key)
+            for key in ("proxy", "type", "risk")
+        },
+    }
+
+
 def choose_browser_probe_language(
     browser_languages: list[dict[str, object]],
     apple_languages: list[str],
@@ -409,13 +683,58 @@ def choose_browser_probe_language(
     return None
 
 
+def windows_env_path(name: str) -> pathlib.Path | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return pathlib.Path(value)
+
+
+def browser_binary_candidates() -> list[pathlib.Path]:
+    if sys.platform == "win32":
+        candidates: list[pathlib.Path] = []
+        for base in (
+            windows_env_path("PROGRAMFILES"),
+            windows_env_path("PROGRAMFILES(X86)"),
+            windows_env_path("LOCALAPPDATA"),
+        ):
+            if not base:
+                continue
+            candidates.extend(
+                [
+                    base / "Google/Chrome/Application/chrome.exe",
+                    base / "Chromium/Application/chrome.exe",
+                    base / "Microsoft/Edge/Application/msedge.exe",
+                ]
+            )
+        return candidates
+    return MACOS_BROWSER_CANDIDATES
+
+
+def browser_profile_roots() -> list[tuple[str, pathlib.Path]]:
+    if sys.platform == "win32":
+        local_appdata = windows_env_path("LOCALAPPDATA")
+        if not local_appdata:
+            return []
+        return [
+            ("Chrome", local_appdata / "Google/Chrome/User Data"),
+            ("Chromium", local_appdata / "Chromium/User Data"),
+            ("Microsoft Edge", local_appdata / "Microsoft/Edge/User Data"),
+        ]
+    return [
+        ("Chrome", pathlib.Path.home() / "Library/Application Support/Google/Chrome"),
+        ("Chromium", pathlib.Path.home() / "Library/Application Support/Chromium"),
+        ("Microsoft Edge", pathlib.Path.home() / "Library/Application Support/Microsoft Edge"),
+    ]
+
+
 def find_browser_binary(explicit_path: str | None = None) -> str | None:
     if explicit_path:
         candidate = pathlib.Path(explicit_path).expanduser()
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
         return None
-    for candidate in BROWSER_CANDIDATES:
+    for candidate in browser_binary_candidates():
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
@@ -557,14 +876,59 @@ def run_browser_probe(
 def make_findings(data: dict[str, object]) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
 
+    collection_errors = data.get("collection_errors", [])
+    if isinstance(collection_errors, list) and collection_errors:
+        findings.append(
+            {
+                "severity": "high",
+                "title": "Required data collection failed",
+                "detail": "; ".join(str(item) for item in collection_errors[:6]),
+            }
+        )
+
     public_ip = data.get("public_ip", {})
     if isinstance(public_ip, dict):
+        ipapi = public_ip.get("ipapi_is") or {}
+        proxycheck = public_ip.get("proxycheck") or {}
+        external_flags: list[str] = []
+
+        if isinstance(ipapi, dict):
+            for flag_name, label in (
+                ("is_datacenter", "datacenter"),
+                ("is_proxy", "proxy"),
+                ("is_vpn", "vpn"),
+                ("is_tor", "tor"),
+                ("is_abuser", "abuser"),
+            ):
+                if truthy_external_flag(ipapi.get(flag_name)):
+                    external_flags.append(f"ipapi.is:{label}")
+            asn = ipapi.get("asn") or {}
+            if isinstance(asn, dict) and str(asn.get("type") or "").lower() == "hosting":
+                external_flags.append("ipapi.is:asn_type=hosting")
+
+        if isinstance(proxycheck, dict):
+            if truthy_external_flag(proxycheck.get("proxy")):
+                external_flags.append(f"proxycheck:proxy={proxycheck.get('type') or 'yes'}")
+            risk = proxycheck.get("risk")
+            if isinstance(risk, (int, float)) and risk >= 60:
+                external_flags.append(f"proxycheck:risk={risk}")
+
+        if external_flags:
+            findings.append(
+                {
+                    "severity": "high",
+                    "title": "External IP intelligence flags egress risk",
+                    "detail": "; ".join(external_flags),
+                }
+            )
+
         ipinfo = public_ip.get("ipinfo") or {}
         ifconfig = public_ip.get("ifconfig") or {}
         org = str(ipinfo.get("org") or ifconfig.get("asn_org") or "")
         hostname = str(ipinfo.get("hostname") or ifconfig.get("hostname") or "")
-        if any(keyword in org.lower() for keyword in ("cloud", "hosting", "dmit", "vps")) or any(
-            keyword in hostname.lower() for keyword in ("host-", "cloud", "vps")
+        if not external_flags and (
+            any(keyword in org.lower() for keyword in ("cloud", "hosting", "dmit", "vps"))
+            or any(keyword in hostname.lower() for keyword in ("host-", "cloud", "vps"))
         ):
             findings.append(
                 {
@@ -630,6 +994,22 @@ def make_findings(data: dict[str, object]) -> list[dict[str, str]]:
                 "detail": "Auto proxy discovery adds another proxy-selection path for some apps.",
             }
         )
+
+    proxy_clients = data.get("proxy_clients", [])
+    if isinstance(proxy_clients, list) and proxy_clients:
+        names = [
+            str(client.get("name"))
+            for client in proxy_clients
+            if isinstance(client, dict) and client.get("name")
+        ]
+        if names:
+            findings.append(
+                {
+                    "severity": "info",
+                    "title": "Proxy client signatures detected",
+                    "detail": ", ".join(names),
+                }
+            )
 
     clash = data.get("clash", {})
     listeners = data.get("listeners", {})
@@ -726,7 +1106,10 @@ def build_recommendations(data: dict[str, object]) -> list[dict[str, str]]:
         if isinstance(item, dict) and item.get("title")
     }
 
-    if "Datacenter egress detected" in finding_titles:
+    if (
+        "External IP intelligence flags egress risk" in finding_titles
+        or "Datacenter egress detected" in finding_titles
+    ):
         recommendations.append(
             {
                 "priority": "P1",
@@ -741,7 +1124,7 @@ def build_recommendations(data: dict[str, object]) -> list[dict[str, str]]:
             {
                 "priority": "P1",
                 "area": "DNS Consistency",
-                "action": "Reset the active macOS network service DNS to Automatic or point it to your local proxy-managed DNS path so it does not advertise mainland public resolvers.",
+                "action": "Reset the active network adapter DNS to Automatic or point it to your local proxy-managed DNS path so it does not advertise mainland public resolvers.",
                 "why": "Even when DNS is intercepted later, mismatched resolver settings are an avoidable inconsistency.",
             }
         )
@@ -799,7 +1182,23 @@ def build_recommendations(data: dict[str, object]) -> list[dict[str, str]]:
     return recommendations
 
 
-def collect_data(
+def collect_public_ip(skip_network: bool) -> dict[str, object]:
+    public_ip: dict[str, object] = {}
+    if skip_network:
+        return public_ip
+    public_ip["ipapi_is"] = fetch_json("https://api.ipapi.is/json") or {}
+    public_ip["ipinfo"] = fetch_json("https://ipinfo.io/json") or {}
+    public_ip["ifconfig"] = fetch_json("https://ifconfig.co/json") or {}
+    cloudflare_trace = fetch_text("https://www.cloudflare.com/cdn-cgi/trace") or ""
+    public_ip["cloudflare_trace"] = cloudflare_trace
+    public_ip["cloudflare_trace_parsed"] = parse_cloudflare_trace(cloudflare_trace)
+    candidates = public_ip_candidates(public_ip)
+    public_ip["observed_ips"] = candidates
+    public_ip["proxycheck"] = fetch_proxycheck(candidates[0]) if candidates else {}
+    return public_ip
+
+
+def collect_macos_data(
     *,
     skip_network: bool,
     skip_browser_probe: bool,
@@ -818,6 +1217,7 @@ def collect_data(
     apple_languages_raw = run_command("defaults", "read", "-g", "AppleLanguages")
     apple_locale_raw = run_command("defaults", "read", "-g", "AppleLocale")
     nwi_raw = run_command("scutil", "--nwi")
+    process_raw = run_command("ps", "-axo", "comm=")
 
     default_route = parse_default_route(str(route_raw.get("stdout", "")))
     active_network = choose_active_network_service(
@@ -844,24 +1244,17 @@ def collect_data(
     wifi_autoproxy_raw = run_networksetup_for_service("-getautoproxyurl")
     wifi_discovery_raw = run_networksetup_for_service("-getproxyautodiscovery")
 
-    public_ip: dict[str, object] = {}
-    if not skip_network:
-        public_ip["ipinfo"] = fetch_json("https://ipinfo.io/json") or {}
-        public_ip["ifconfig"] = fetch_json("https://ifconfig.co/json") or {}
-        public_ip["cloudflare_trace"] = fetch_text("https://www.cloudflare.com/cdn-cgi/trace") or ""
+    public_ip = collect_public_ip(skip_network)
 
     clash_configs = [
         config
         for config in (sanitize_clash_excerpt(path) for path in CLASH_CONFIG_CANDIDATES)
         if config is not None
     ]
+    proxy_clients = detect_proxy_clients(str(process_raw.get("stdout", "")))
 
     browser_languages: list[dict[str, object]] = []
-    for browser_name, base_path in (
-        ("Chrome", pathlib.Path.home() / "Library/Application Support/Google/Chrome"),
-        ("Chromium", pathlib.Path.home() / "Library/Application Support/Chromium"),
-        ("Microsoft Edge", pathlib.Path.home() / "Library/Application Support/Microsoft Edge"),
-    ):
+    for browser_name, base_path in browser_profile_roots():
         if base_path.exists():
             browser_languages.append(extract_browser_languages(base_path, browser_name))
 
@@ -899,7 +1292,7 @@ def collect_data(
         ),
         "locale": {
             "lang": os.environ.get("LANG"),
-            "lc_all": os.environ.get("LC_ALL"),
+            "lc_all": "",
             "tz": os.environ.get("TZ"),
             "apple_languages": apple_languages,
             "apple_locale": str(apple_locale_raw.get("stdout", "")),
@@ -916,6 +1309,7 @@ def collect_data(
             "auto_proxy_discovery": str(wifi_discovery_raw.get("stdout", "")),
         },
         "clash": {"configs": clash_configs},
+        "proxy_clients": proxy_clients,
         "raw_command_status": {
             "proxy": proxy_raw,
             "dns": dns_raw,
@@ -925,11 +1319,197 @@ def collect_data(
             "udp": udp_raw,
             "network_service_order": network_service_order_raw,
             "network_services": network_services_raw,
+            "processes": process_raw,
         },
     }
     data["findings"] = make_findings(data)
     data["recommendations"] = build_recommendations(data)
     return data
+
+
+def parse_windows_proxy_registry(raw: str) -> dict[str, object]:
+    settings: dict[str, object] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or "REG_" not in stripped:
+            continue
+        parts = stripped.split(None, 2)
+        if len(parts) == 3:
+            settings[parts[0]] = parts[2].strip()
+    return settings
+
+
+def collect_windows_data(
+    *,
+    skip_network: bool,
+    skip_browser_probe: bool,
+    browser_path: str | None,
+) -> dict[str, object]:
+    now = dt.datetime.now().astimezone()
+
+    ipconfig_raw = run_command("ipconfig", "/all", timeout=10)
+    route_raw = run_command("route", "print", timeout=10)
+    tcp_raw = run_command("netstat", "-ano", "-p", "tcp", timeout=10)
+    udp_raw = run_command("netstat", "-ano", "-p", "udp", timeout=10)
+    winhttp_proxy_raw = run_command("netsh", "winhttp", "show", "proxy", timeout=10)
+    user_proxy_raw = run_command(
+        "reg",
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        timeout=10,
+    )
+    interface_raw = run_command(
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty InterfaceAlias",
+        timeout=10,
+    )
+    process_raw = run_command(
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-Process | ForEach-Object { if ($_.Path) { $_.Path } else { $_.ProcessName } }",
+        timeout=10,
+    )
+    culture_raw = run_command(
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-Culture | Select-Object -ExpandProperty Name",
+        timeout=10,
+    )
+    system_locale_raw = run_command(
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-WinSystemLocale | Select-Object -ExpandProperty Name",
+        timeout=10,
+    )
+    timezone_raw = run_command("tzutil", "/g", timeout=10)
+
+    public_ip = collect_public_ip(skip_network)
+    browser_languages: list[dict[str, object]] = []
+    for browser_name, base_path in browser_profile_roots():
+        if base_path.exists():
+            browser_languages.append(extract_browser_languages(base_path, browser_name))
+
+    browser_probe = run_browser_probe(
+        browser_languages,
+        [],
+        skip_browser_probe=skip_browser_probe or skip_network,
+        browser_path=browser_path,
+    )
+    if skip_network and browser_probe.get("status") == "skipped":
+        browser_probe["reason"] = "Browser probe was skipped because --skip-network was set."
+
+    raw_command_status = {
+        "ipconfig": ipconfig_raw,
+        "route": route_raw,
+        "tcp": tcp_raw,
+        "udp": udp_raw,
+        "winhttp_proxy": winhttp_proxy_raw,
+        "user_proxy": user_proxy_raw,
+        "interface": interface_raw,
+        "processes": process_raw,
+        "culture": culture_raw,
+        "system_locale": system_locale_raw,
+        "timezone": timezone_raw,
+    }
+    collection_errors = command_failure_notes(
+        raw_command_status,
+        (
+            "ipconfig",
+            "route",
+            "tcp",
+            "udp",
+            "winhttp_proxy",
+            "user_proxy",
+            "interface",
+            "processes",
+            "culture",
+            "system_locale",
+            "timezone",
+        ),
+    )
+
+    windows_proxy = parse_windows_proxy_registry(command_stdout(user_proxy_raw))
+    active_interface = command_stdout(interface_raw)
+    proxy_clients = detect_proxy_clients(command_stdout(process_raw))
+
+    data: dict[str, object] = {
+        "generated_at": now.isoformat(),
+        "host": {
+            "platform": sys.platform,
+            "project_root": PROJECT_ROOT.name,
+        },
+        "public_ip": public_ip,
+        "collection_errors": collection_errors,
+        "proxy": windows_proxy,
+        "dns": {
+            "nameservers": parse_windows_ipconfig_dns(command_stdout(ipconfig_raw)),
+            "wifi_dns_raw": command_stdout(ipconfig_raw),
+            "nwi": "",
+        },
+        "route": {
+            "default": {"interface": active_interface},
+            "split_tunnel_routes": [],
+        },
+        "active_network": {
+            "service": "Windows",
+            "interface": active_interface,
+            "source": "Get-NetRoute",
+        },
+        "listeners": parse_listener_summary(
+            str(tcp_raw.get("stdout", "")),
+            str(udp_raw.get("stdout", "")),
+        ),
+        "locale": {
+            "lang": command_stdout(culture_raw),
+            "lc_all": "",
+            "tz": command_stdout(timezone_raw),
+            "apple_languages": [],
+            "apple_locale": command_stdout(system_locale_raw),
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S %Z %z"),
+        },
+        "browser_languages": browser_languages,
+        "browser_probe": browser_probe,
+        "networksetup": {
+            "service": "Windows",
+            "web_proxy": windows_proxy,
+            "secure_web_proxy": windows_proxy,
+            "socks_proxy": windows_proxy,
+            "auto_proxy_url": {"AutoConfigURL": windows_proxy.get("AutoConfigURL", "")},
+            "auto_proxy_discovery": command_stdout(winhttp_proxy_raw),
+        },
+        "clash": {"configs": []},
+        "proxy_clients": proxy_clients,
+        "raw_command_status": raw_command_status,
+    }
+    data["findings"] = make_findings(data)
+    data["recommendations"] = build_recommendations(data)
+    return data
+
+
+def collect_data(
+    *,
+    skip_network: bool,
+    skip_browser_probe: bool,
+    browser_path: str | None,
+) -> dict[str, object]:
+    if sys.platform == "darwin":
+        return collect_macos_data(
+            skip_network=skip_network,
+            skip_browser_probe=skip_browser_probe,
+            browser_path=browser_path,
+        )
+    if sys.platform == "win32":
+        return collect_windows_data(
+            skip_network=skip_network,
+            skip_browser_probe=skip_browser_probe,
+            browser_path=browser_path,
+        )
+    raise RuntimeError("This tool currently supports macOS and Windows only.")
 
 
 def severity_label(level: str) -> str:
@@ -948,6 +1528,68 @@ def probe_status_label(status: str | None) -> str:
         "skipped": "已跳过",
         "unavailable": "不可用",
     }.get(status or "", status or "未知")
+
+
+def browser_probe_result_label(status: str, candidates: list[object]) -> str:
+    if status == "skipped":
+        return "未检测"
+    if status == "unavailable":
+        return "浏览器不可用"
+    if status == "error":
+        return "检测失败"
+    if status != "ok":
+        return "未知"
+
+    counts = browser_webrtc_candidate_counts(candidates)
+    if counts["private"]:
+        return "发现本机内网 IP 泄露"
+    if counts["mdns"]:
+        return "未发现本机内网 IP 泄露"
+    if counts["public"]:
+        return "未发现本机内网 IP 泄露"
+    return "未看到 WebRTC 暴露地址"
+
+
+def browser_webrtc_candidate_counts(candidates: list[object]) -> dict[str, int]:
+    private_count = 0
+    public_count = 0
+    mdns_count = 0
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_type = str(candidate.get("candidateType") or "")
+        scope = candidate_address_scope(str(candidate.get("address") or ""))
+        if candidate_type == "host" and scope == "private":
+            private_count += 1
+        elif scope == "public":
+            public_count += 1
+        elif candidate_type == "host" and scope == "mdns":
+            mdns_count += 1
+
+    return {"private": private_count, "public": public_count, "mdns": mdns_count}
+
+
+def browser_probe_result_detail(status: str, candidates: list[object]) -> str:
+    if status != "ok":
+        return ""
+    counts = browser_webrtc_candidate_counts(candidates)
+    if counts["private"]:
+        return f"WebRTC 返回了 {counts['private']} 个本机内网地址，目标网站可能看到你的局域网地址。"
+    if counts["mdns"]:
+        return "浏览器只暴露了匿名 .local 地址，没有直接暴露本机内网 IP。"
+    if counts["public"]:
+        return "WebRTC 只返回了公网候选，没有看到本机内网地址。"
+    return "没有采集到可展示的 WebRTC 地址。"
+
+
+def browser_probe_problem_note(browser_probe: dict[str, object]) -> str:
+    status = str(browser_probe.get("status") or "")
+    if status == "ok":
+        return ""
+    reason = localize_browser_probe_reason(str(browser_probe.get("reason") or ""))
+    page_error = str(browser_probe.get("page_error") or "")
+    stderr = str(browser_probe.get("stderr_excerpt") or "")
+    return reason or page_error or stderr[:240]
 
 
 def format_value(value: object) -> str:
@@ -970,6 +1612,8 @@ def localize_finding(item: dict[str, object]) -> tuple[str, str]:
                 "公网出口 ASN / 主机名显示为托管网络：",
             ),
         )
+    if title == "External IP intelligence flags egress risk":
+        return ("外部 IP 情报标记出口风险", detail.replace("; ", "；"))
     if title == "System DNS points to China-oriented public resolvers":
         return ("系统 DNS 指向中国公共解析器", "系统当前配置的解析器里包含常见中国公共 DNS。")
     if title == "Local language signals include Chinese":
@@ -979,14 +1623,16 @@ def localize_finding(item: dict[str, object]) -> tuple[str, str]:
         return (f"{match.group('browser')} 配置文件暴露中文 Accept-Language", f"检测到 {detail}。")
     if title == "WPAD auto proxy discovery is enabled":
         return ("系统开启了 WPAD 自动代理发现", "自动代理发现会为部分应用增加额外的代理选择路径。")
+    if title == "Proxy client signatures detected":
+        return ("检测到代理客户端线索", f"本机存在这些代理客户端进程或配置路径：{detail}。")
     if title == "Local DNS interception appears active":
         return ("本地 DNS 劫持看起来是生效的", "Clash/Mihomo 正在监听 127.0.0.1:53，并启用了 DNS 劫持。")
     if title == "Browser probe sent Chinese Accept-Language":
         return ("浏览器探针实际发出了中文语言头", detail.replace("Echo endpoint saw: ", "回显站点看到的 Accept-Language 为："))
     if title == "Browser WebRTC exposes private host candidates":
-        return ("浏览器 WebRTC 暴露了私网 host 候选", "浏览器探针看到了原始私网 ICE host 地址。")
+        return ("WebRTC 暴露了本机内网 IP", "目标网站可能通过浏览器看到你的局域网地址。")
     if title == "Browser WebRTC local addresses are obfuscated with mDNS":
-        return ("浏览器 WebRTC 已用 mDNS 混淆本地地址", "host 候选显示为 `.local`，没有直接暴露原始私网 IP。")
+        return ("未发现 WebRTC 内网 IP 泄露", "浏览器只显示匿名 `.local` 地址，没有直接暴露本机内网 IP。")
     if title == "Browser WebRTC public candidate differs from HTTP egress IP":
         return (
             "浏览器 WebRTC 公网候选与 HTTP 出口不一致",
@@ -1043,8 +1689,8 @@ def localize_browser_probe_reason(text: str | None) -> str:
     if not text:
         return ""
     mapping = {
-        "Browser probe was skipped by configuration.": "浏览器探针已按配置跳过。",
-        "Browser probe was skipped because --skip-network was set.": "由于传入了 --skip-network，浏览器探针已跳过。",
+        "Browser probe was skipped by configuration.": "本次未运行浏览器侧检测。",
+        "Browser probe was skipped because --skip-network was set.": "由于传入了 --skip-network，本次未运行浏览器侧检测。",
         "No supported browser binary was found.": "未找到可用的 Chrome / Chromium / Edge 浏览器可执行文件。",
         "Could not parse browser probe payload.": "无法解析浏览器探针返回的数据。",
     }
@@ -1099,17 +1745,19 @@ def render_markdown(data: dict[str, object]) -> str:
 
     public_ip = data.get("public_ip", {})
     if isinstance(public_ip, dict):
-        ipinfo = public_ip.get("ipinfo") or {}
-        ifconfig = public_ip.get("ifconfig") or {}
+        summary = public_ip_summary(public_ip)
         lines.extend(
             [
                 "",
                 "## 公网出口",
                 "",
-                f"- IP：{ipinfo.get('ip') or ifconfig.get('ip') or '未知'}",
-                f"- ASN / 组织：{ipinfo.get('org') or ifconfig.get('asn_org') or '未知'}",
-                f"- 位置：{ipinfo.get('city') or ifconfig.get('city') or '未知'}，{ipinfo.get('region') or ifconfig.get('region_name') or ''} {ipinfo.get('country') or ifconfig.get('country_iso') or ''}".strip(),
-                f"- 时区：{ipinfo.get('timezone') or ifconfig.get('time_zone') or '未知'}",
+                f"- IP：{summary.get('ip') or '未知'}",
+                f"- 观测到的 IP：{', '.join(summary.get('observed_ips', [])) or '未知'}",
+                f"- ASN / 组织：{summary.get('asn_org') or '未知'}",
+                f"- 位置：{summary.get('city') or '未知'}，{summary.get('region') or ''} {summary.get('country') or ''}".strip(),
+                f"- 时区：{summary.get('timezone') or '未知'}",
+                f"- ipapi.is 风险：{summary.get('ipapi_flags')}",
+                f"- proxycheck 风险：{summary.get('proxycheck_flags')}",
             ]
         )
 
@@ -1169,17 +1817,23 @@ def render_markdown(data: dict[str, object]) -> str:
     browser_probe = data.get("browser_probe", {})
     if isinstance(browser_probe, dict):
         lines.extend(["", "## 浏览器侧探针", ""])
-        lines.append(f"- 状态：{probe_status_label(str(browser_probe.get('status') or ''))}")
-        if browser_probe.get("reason"):
-            lines.append(f"- 说明：{localize_browser_probe_reason(str(browser_probe.get('reason')))}")
-        if browser_probe.get("browser_path"):
-            lines.append(f"- 浏览器：{browser_probe.get('browser_path')}")
-        if browser_probe.get("language_hint"):
-            lines.append(f"- 语言提示：{browser_probe.get('language_hint')}")
-        if browser_probe.get("note"):
-            lines.append(f"- 备注：{localize_browser_probe_note(str(browser_probe.get('note')))}")
-
         probe_result = browser_probe.get("result", {})
+        candidates: list[object] = []
+        if isinstance(probe_result, dict):
+            webrtc_data = probe_result.get("webrtc", {})
+            if isinstance(webrtc_data, dict) and isinstance(webrtc_data.get("candidates"), list):
+                candidates = webrtc_data["candidates"]
+        browser_status = str(browser_probe.get("status") or "")
+        lines.append(f"- WebRTC 结论：{browser_probe_result_label(browser_status, candidates)}")
+        if browser_status == "ok":
+            detail = browser_probe_result_detail(browser_status, candidates)
+            if detail:
+                lines.append(f"- 说明：{detail}")
+        else:
+            note = browser_probe_problem_note(browser_probe)
+            if note:
+                lines.append(f"- 检测说明：{note}")
+
         if isinstance(probe_result, dict):
             navigator_info = probe_result.get("navigator", {})
             header_echo = probe_result.get("headerEcho", {})
@@ -1202,7 +1856,7 @@ def render_markdown(data: dict[str, object]) -> str:
             if isinstance(webrtc, dict):
                 candidates = webrtc.get("candidates", [])
                 lines.append(f"- WebRTC 是否可用：{webrtc.get('supported')}")
-                lines.append(f"- ICE 候选数量：{len(candidates) if isinstance(candidates, list) else 0}")
+                lines.append(f"- WebRTC 地址数量：{len(candidates) if isinstance(candidates, list) else 0}")
                 if isinstance(candidates, list):
                     for candidate in candidates:
                         if not isinstance(candidate, dict):
@@ -1226,20 +1880,35 @@ def render_markdown(data: dict[str, object]) -> str:
             ]
         )
 
-    clash = data.get("clash", {})
-    if isinstance(clash, dict) and clash.get("configs"):
-        lines.extend(["", "## 代理运行态快照", ""])
-        for config in clash["configs"]:
-            if not isinstance(config, dict):
-                continue
-            lines.append(f"- {config.get('path')}")
-            for excerpt in config.get("excerpt", []):
-                lines.append(f"  - `{excerpt}`")
+    proxy_clients = data.get("proxy_clients", [])
+    if isinstance(proxy_clients, list):
+        lines.extend(["", "## 代理客户端识别", ""])
+        if proxy_clients:
+            for client in proxy_clients:
+                if not isinstance(client, dict):
+                    continue
+                lines.append(f"- {client.get('name')}")
+                processes = client.get("processes", [])
+                if isinstance(processes, list) and processes:
+                    lines.append(f"  - 进程：{', '.join(str(item) for item in processes)}")
+                paths = client.get("paths", [])
+                if isinstance(paths, list) and paths:
+                    lines.append(f"  - 路径：{', '.join(str(item) for item in paths)}")
+                configs = client.get("configs", [])
+                if isinstance(configs, list):
+                    for config in configs:
+                        if not isinstance(config, dict):
+                            continue
+                        lines.append(f"  - 配置摘要：{config.get('path')}")
+                        for excerpt in config.get("excerpt", []):
+                            lines.append(f"    - `{excerpt}`")
+        else:
+            lines.append("- 未发现已知代理客户端进程或配置路径。")
 
     return "\n".join(lines) + "\n"
 
 
-def render_html(data: dict[str, object]) -> str:
+def render_html_legacy(data: dict[str, object]) -> str:
     findings = [item for item in data.get("findings", []) if isinstance(item, dict)]
     recommendations = [item for item in data.get("recommendations", []) if isinstance(item, dict)]
     high_count = sum(1 for item in findings if item.get("severity") == "high")
@@ -1249,8 +1918,7 @@ def render_html(data: dict[str, object]) -> str:
     total_findings = len(findings)
 
     public_ip = data.get("public_ip", {}) if isinstance(data.get("public_ip"), dict) else {}
-    ipinfo = public_ip.get("ipinfo") or {}
-    ifconfig = public_ip.get("ifconfig") or {}
+    public_summary = public_ip_summary(public_ip)
 
     browser_probe = data.get("browser_probe", {}) if isinstance(data.get("browser_probe"), dict) else {}
     probe_result = browser_probe.get("result", {}) if isinstance(browser_probe.get("result"), dict) else {}
@@ -1372,7 +2040,7 @@ def render_html(data: dict[str, object]) -> str:
             continue
         scope = candidate_address_scope(str(candidate.get("address") or ""))
         scope_text = {
-            "mdns": "mDNS 混淆",
+            "mdns": "匿名 .local 地址",
             "private": "私网",
             "public": "公网",
             "hostname": "主机名",
@@ -1388,10 +2056,13 @@ def render_html(data: dict[str, object]) -> str:
         )
 
     network_rows = [
-        ["公网 IP", esc(ipinfo.get("ip") or ifconfig.get("ip"))],
-        ["ASN / 组织", esc(ipinfo.get("org") or ifconfig.get("asn_org"))],
-        ["位置", esc(f"{ipinfo.get('city') or ifconfig.get('city') or '未知'}，{ipinfo.get('region') or ifconfig.get('region_name') or ''} {ipinfo.get('country') or ifconfig.get('country_iso') or ''}")],
-        ["时区", esc(ipinfo.get("timezone") or ifconfig.get("time_zone"))],
+        ["公网 IP", esc(public_summary.get("ip"))],
+        ["观测到的 IP", esc(", ".join(public_summary.get("observed_ips", [])))],
+        ["ASN / 组织", esc(public_summary.get("asn_org"))],
+        ["位置", esc(f"{public_summary.get('city') or '未知'}，{public_summary.get('region') or ''} {public_summary.get('country') or ''}")],
+        ["时区", esc(public_summary.get("timezone"))],
+        ["ipapi.is 风险", esc(public_summary.get("ipapi_flags"))],
+        ["proxycheck 风险", esc(public_summary.get("proxycheck_flags"))],
         ["活跃网络服务", esc((data.get("active_network") or {}).get("service"))],
         ["活跃接口", esc((data.get("active_network") or {}).get("interface"))],
         ["系统 DNS", esc(", ".join((data.get("dns") or {}).get("nameservers", [])))],
@@ -1428,6 +2099,48 @@ def render_html(data: dict[str, object]) -> str:
         ["自动代理 URL", esc((data.get("networksetup") or {}).get("auto_proxy_url"))],
         ["自动代理发现", esc((data.get("networksetup") or {}).get("auto_proxy_discovery"))],
     ]
+
+    client_details = []
+    proxy_clients = data.get("proxy_clients", [])
+    if isinstance(proxy_clients, list):
+        for client in proxy_clients:
+            if not isinstance(client, dict):
+                continue
+            processes = client.get("processes", [])
+            paths = client.get("paths", [])
+            configs = client.get("configs", [])
+            summary_rows = [
+                ["进程线索", esc(", ".join(str(item) for item in processes) if isinstance(processes, list) and processes else "未发现")],
+                ["配置路径", esc(", ".join(str(item) for item in paths) if isinstance(paths, list) and paths else "未发现")],
+            ]
+            config_blocks = []
+            if isinstance(configs, list):
+                for config in configs:
+                    if not isinstance(config, dict):
+                        continue
+                    excerpt = "\n".join(str(line) for line in config.get("excerpt", []))
+                    config_blocks.append(
+                        f"""
+                        <details class="details-block">
+                          <summary>{html.escape(str(config.get("path") or "配置文件"))}</summary>
+                          <pre>{html.escape(excerpt)}</pre>
+                        </details>
+                        """
+                    )
+            client_details.append(
+                f"""
+                <article class="evidence">
+                  <h3>{html.escape(str(client.get("name") or "代理客户端"))}</h3>
+                  {render_table(summary_rows, "暂无客户端线索。")}
+                  {"".join(config_blocks)}
+                </article>
+                """
+            )
+
+    if not client_details:
+        client_details.append(
+            '<article class="evidence"><h3>未发现已知客户端</h3><p class="empty">仍会继续基于系统代理、路由、DNS、出口和浏览器结果进行通用审计。</p></article>'
+        )
 
     clash_details = []
     for config in (data.get("clash", {}) or {}).get("configs", []):
@@ -1869,7 +2582,7 @@ def render_html(data: dict[str, object]) -> str:
         <div><label>生成时间</label><span>{esc(data.get("generated_at"))}</span></div>
         <div><label>平台</label><span>{esc((data.get("host") or {}).get("platform"))}</span></div>
         <div><label>项目</label><span>{esc((data.get("host") or {}).get("project_root"))}</span></div>
-        <div><label>公网出口</label><span>{esc(ipinfo.get("ip") or ifconfig.get("ip"))}</span></div>
+        <div><label>公网出口</label><span>{esc(public_summary.get("ip"))}</span></div>
         <div><label>浏览器探针</label><span>{html.escape(probe_status_label(str(browser_probe.get("status") or "")))}</span></div>
       </div>
       <nav class="nav">
@@ -1886,11 +2599,11 @@ def render_html(data: dict[str, object]) -> str:
       <header class="report-hero" id="overview">
         <div class="eyebrow">Network Fingerprint Audit</div>
         <h2>把所有“会露馅的信号”放进一份真正能读的报告里</h2>
-        <p class="hero-copy">这份报告把出口、DNS、系统语言、浏览器 profile、浏览器请求头和 WebRTC 候选放进统一视图，优先给你结论，再给你证据，而不是把原始字段散在页面各处。</p>
+        <p class="hero-copy">这份报告把出口、DNS、系统语言、浏览器 profile、浏览器请求头和 WebRTC 地址暴露放进统一视图，优先给你结论，再给你证据，而不是把原始字段散在页面各处。</p>
         <div class="hero-meta">
           <span>报告格式：HTML / Markdown / JSON</span>
           <span>浏览器探针：{html.escape(probe_status_label(str(browser_probe.get("status") or "")))}</span>
-          <span>出口 ASN：{esc(ipinfo.get("org") or ifconfig.get("asn_org"))}</span>
+          <span>出口 ASN：{esc(public_summary.get("asn_org"))}</span>
         </div>
         <div class="hero-grid">
           <div class="report-panel">
@@ -1974,10 +2687,10 @@ def render_html(data: dict[str, object]) -> str:
         </div>
         <div class="table-panel" style="margin-top:16px;">
           <div class="section-head">
-            <h2>WebRTC ICE 候选</h2>
+            <h2>WebRTC 地址明细</h2>
             <span>{len(candidate_rows)} Candidates</span>
           </div>
-          {render_table(["类型", "协议", "地址", "范围"], candidate_rows, "未采集到 WebRTC 候选。")}
+          {render_table(["类型", "协议", "地址", "范围"], candidate_rows, "未采集到 WebRTC 地址。")}
         </div>
       </section>
 
@@ -2026,6 +2739,892 @@ def render_html(data: dict[str, object]) -> str:
 """
 
 
+def render_html(data: dict[str, object]) -> str:
+    findings = [item for item in data.get("findings", []) if isinstance(item, dict)]
+    recommendations = [item for item in data.get("recommendations", []) if isinstance(item, dict)]
+    high_count = sum(1 for item in findings if item.get("severity") == "high")
+    medium_count = sum(1 for item in findings if item.get("severity") == "medium")
+    low_count = sum(1 for item in findings if item.get("severity") == "low")
+    info_count = sum(1 for item in findings if item.get("severity") == "info")
+    total_findings = len(findings)
+    risk_score = min(100, high_count * 35 + medium_count * 18 + low_count * 8 + info_count * 2)
+
+    public_ip = data.get("public_ip", {}) if isinstance(data.get("public_ip"), dict) else {}
+    public_summary = public_ip_summary(public_ip)
+    active_network = data.get("active_network", {}) if isinstance(data.get("active_network"), dict) else {}
+    dns = data.get("dns", {}) if isinstance(data.get("dns"), dict) else {}
+    locale = data.get("locale", {}) if isinstance(data.get("locale"), dict) else {}
+    route = data.get("route", {}) if isinstance(data.get("route"), dict) else {}
+    default_route = route.get("default", {}) if isinstance(route.get("default"), dict) else {}
+    networksetup = data.get("networksetup", {}) if isinstance(data.get("networksetup"), dict) else {}
+    listeners = data.get("listeners", {}) if isinstance(data.get("listeners"), dict) else {}
+    browser_probe = data.get("browser_probe", {}) if isinstance(data.get("browser_probe"), dict) else {}
+    probe_result = browser_probe.get("result", {}) if isinstance(browser_probe.get("result"), dict) else {}
+    navigator_info = probe_result.get("navigator", {}) if isinstance(probe_result.get("navigator"), dict) else {}
+    header_echo = probe_result.get("headerEcho", {}) if isinstance(probe_result.get("headerEcho"), dict) else {}
+    webrtc = probe_result.get("webrtc", {}) if isinstance(probe_result.get("webrtc"), dict) else {}
+    candidates = webrtc.get("candidates", []) if isinstance(webrtc.get("candidates"), list) else []
+    browser_probe_status = str(browser_probe.get("status") or "unknown")
+    accept_language = get_case_insensitive(header_echo.get("headers"), "Accept-Language")
+    user_agent = get_case_insensitive(header_echo.get("headers"), "User-Agent")
+
+    if high_count:
+        posture = ("需要优先处理", "critical", "先看高风险项，再复测浏览器与出口证据。")
+    elif medium_count:
+        posture = ("存在明显不一致", "review", "建议先处理语言、DNS、WebRTC 这类容易形成组合信号的问题。")
+    else:
+        posture = ("暂无明显异常", "stable", "本次审计没有发现高优先级风险，建议保留报告用于后续 diff。")
+
+    def esc(value: object) -> str:
+        return html.escape(format_value(value))
+
+    def severity_class(level: object) -> str:
+        return str(level or "info").lower()
+
+    def severity_pill(level: object) -> str:
+        cls = severity_class(level)
+        return f'<span class="pill pill-{html.escape(cls)}">{html.escape(severity_label(cls))}</span>'
+
+    def render_table(rows: list[list[str]], empty_text: str) -> str:
+        if not rows:
+            return f'<p class="empty">{html.escape(empty_text)}</p>'
+        rendered_rows = []
+        for label, value in rows:
+            rendered_rows.append(
+                f"<tr><th>{html.escape(label)}</th><td>{value}</td></tr>"
+            )
+        return f'<table class="kv-table"><tbody>{"".join(rendered_rows)}</tbody></table>'
+
+    def metric(label: str, value: object, helper: str = "") -> str:
+        helper_html = f"<small>{html.escape(helper)}</small>" if helper else ""
+        return f"""
+        <div class="metric">
+          <span>{html.escape(label)}</span>
+          <strong>{esc(value)}</strong>
+          {helper_html}
+        </div>
+        """
+
+    def signal(label: str, value: object, state: str, detail: str = "") -> str:
+        detail_html = f"<small>{html.escape(detail)}</small>" if detail else ""
+        return f"""
+        <div class="signal signal-{html.escape(state)}">
+          <span>{html.escape(label)}</span>
+          <strong>{esc(value)}</strong>
+          {detail_html}
+        </div>
+        """
+
+    finding_cards = []
+    for index, item in enumerate(findings, start=1):
+        title, detail = localize_finding(item)
+        severity = severity_class(item.get("severity"))
+        finding_cards.append(
+            f"""
+            <article class="finding finding-{html.escape(severity)}">
+              <div class="finding-index">{index:02d}</div>
+              <div>
+                <div class="finding-top">{severity_pill(severity)}</div>
+                <h3>{html.escape(title)}</h3>
+                <p>{html.escape(detail)}</p>
+              </div>
+            </article>
+            """
+        )
+
+    recommendation_cards = []
+    for item in recommendations:
+        priority, area, action, why = localize_recommendation(item)
+        recommendation_cards.append(
+            f"""
+            <article class="action-item">
+              <div class="priority">{html.escape(priority)}</div>
+              <div>
+                <h3>{html.escape(area)}</h3>
+                <p>{html.escape(action)}</p>
+                <small>{html.escape(why)}</small>
+              </div>
+            </article>
+            """
+        )
+
+    dns_nameservers = dns.get("nameservers", []) if isinstance(dns.get("nameservers"), list) else []
+    observed_ips = public_summary.get("observed_ips", [])
+    ipapi_flags = public_summary.get("ipapi_flags")
+    proxycheck_flags = public_summary.get("proxycheck_flags")
+    ipapi_flag_parts: list[str] = []
+    if isinstance(ipapi_flags, dict):
+        for key, label in (
+            ("is_datacenter", "数据中心"),
+            ("is_proxy", "代理"),
+            ("is_vpn", "VPN"),
+            ("is_tor", "Tor"),
+            ("is_abuser", "滥用记录"),
+        ):
+            if truthy_external_flag(ipapi_flags.get(key)):
+                ipapi_flag_parts.append(label)
+    if isinstance(proxycheck_flags, dict) and truthy_external_flag(proxycheck_flags.get("proxy")):
+        proxy_type = str(proxycheck_flags.get("type") or "proxy")
+        proxy_risk = proxycheck_flags.get("risk")
+        ip_risk_brief = f"{proxy_type} / risk {proxy_risk}" if proxy_risk not in (None, "") else proxy_type
+    elif ipapi_flag_parts:
+        ip_risk_brief = " / ".join(ipapi_flag_parts)
+    else:
+        ip_risk_brief = "未标记代理风险"
+
+    browser_languages = data.get("browser_languages", []) if isinstance(data.get("browser_languages"), list) else []
+    profile_count = 0
+    active_language = "未知"
+    for browser in browser_languages:
+        if not isinstance(browser, dict):
+            continue
+        profiles = browser.get("profiles", [])
+        last_used = str(browser.get("last_used") or "")
+        if not isinstance(profiles, list):
+            continue
+        profile_count += len(profiles)
+        for profile in profiles:
+            if isinstance(profile, dict) and str(profile.get("profile") or "") == last_used:
+                active_language = str(profile.get("accept_languages") or active_language)
+
+    webrtc_counts = browser_webrtc_candidate_counts(candidates)
+    private_candidates = webrtc_counts["private"]
+    public_candidates = webrtc_counts["public"]
+    mdns_candidates = webrtc_counts["mdns"]
+
+    webrtc_result = browser_probe_result_label(browser_probe_status, candidates)
+    probe_problem_note = browser_probe_problem_note(browser_probe)
+    webrtc_result_detail = browser_probe_result_detail(browser_probe_status, candidates)
+    webrtc_detail = (
+        webrtc_result_detail
+        if browser_probe_status == "ok"
+        else (probe_problem_note or "未完成浏览器侧检测")
+    )
+
+    finding_summary = "".join(finding_cards) or """
+      <article class="finding finding-stable">
+        <div class="finding-index">OK</div>
+        <div><h3>当前没有明显异常</h3><p>本次审计没有发现需要优先处理的问题。</p></div>
+      </article>
+    """
+
+    action_summary = "".join(recommendation_cards) or '<p class="empty">暂无修复建议。</p>'
+
+    browser_rows = [["WebRTC 结论", html.escape(webrtc_result)]]
+    if browser_probe_status == "ok":
+        browser_rows.extend(
+            [
+                ["说明", html.escape(webrtc_result_detail)],
+                ["navigator.language", esc(navigator_info.get("language"))],
+                ["navigator.languages", esc(navigator_info.get("languages"))],
+                ["浏览器时区", esc(navigator_info.get("timezone"))],
+                ["回显出口 IP", esc(header_echo.get("origin"))],
+                ["Accept-Language", esc(accept_language)],
+                ["User-Agent", esc(user_agent)],
+            ]
+        )
+    else:
+        browser_rows.append(["检测说明", html.escape(probe_problem_note or "浏览器侧检测未完成。")])
+
+    webrtc_rows: list[list[str]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        scope = candidate_address_scope(str(candidate.get("address") or ""))
+        scope_text = {
+            "mdns": "匿名 .local 地址",
+            "private": "私网",
+            "public": "公网",
+            "hostname": "主机名",
+            "unknown": "未知",
+        }.get(scope, scope)
+        address = f"{candidate.get('address') or 'unknown'}:{candidate.get('port') or 'unknown'}"
+        webrtc_rows.append(
+            [
+                f"{candidate.get('candidateType') or 'unknown'} / {candidate.get('protocol') or 'unknown'}",
+                f"<code>{html.escape(address)}</code><small>{html.escape(scope_text)}</small>",
+            ]
+        )
+
+    network_rows = [
+        ["公网 IP", esc(public_summary.get("ip"))],
+        ["观测 IP", esc(", ".join(observed_ips) if isinstance(observed_ips, list) else observed_ips)],
+        ["ASN / 组织", esc(public_summary.get("asn_org"))],
+        ["位置", esc(f"{public_summary.get('city') or '未知'}，{public_summary.get('region') or ''} {public_summary.get('country') or ''}")],
+        ["时区", esc(public_summary.get("timezone"))],
+        ["ipapi.is", esc(public_summary.get("ipapi_flags"))],
+        ["proxycheck", esc(public_summary.get("proxycheck_flags"))],
+        ["系统 DNS", esc(", ".join(dns_nameservers))],
+        ["当前网络服务 DNS", esc(dns.get("wifi_dns_raw"))],
+        ["活跃网络服务", esc(active_network.get("service"))],
+        ["活跃接口", esc(active_network.get("interface"))],
+    ]
+
+    locale_rows = [
+        ["LANG", esc(locale.get("lang"))],
+        ["LC_ALL", esc(locale.get("lc_all"))],
+        ["AppleLanguages", esc(locale.get("apple_languages"))],
+        ["AppleLocale", esc(locale.get("apple_locale"))],
+        ["本地时间", esc(locale.get("timestamp"))],
+    ]
+
+    proxy_rows = [
+        ["Web 代理", esc(networksetup.get("web_proxy"))],
+        ["HTTPS 代理", esc(networksetup.get("secure_web_proxy"))],
+        ["SOCKS 代理", esc(networksetup.get("socks_proxy"))],
+        ["自动代理 URL", esc(networksetup.get("auto_proxy_url"))],
+        ["自动代理发现", esc(networksetup.get("auto_proxy_discovery"))],
+    ]
+
+    route_rows = [
+        ["默认网关", esc(default_route.get("gateway"))],
+        ["默认接口", esc(default_route.get("interface"))],
+        ["目的地", esc(default_route.get("destination"))],
+        ["路由 mask", esc(default_route.get("mask"))],
+        ["TUN 分流条目数", esc(len(route.get("split_tunnel_routes", [])) if isinstance(route.get("split_tunnel_routes"), list) else 0)],
+        ["127.0.0.1:53 TCP", "监听中" if listeners.get("tcp_127_0_0_1_53") else "未监听"],
+        ["127.0.0.1:53 UDP", "监听中" if listeners.get("udp_127_0_0_1_53") else "未监听"],
+        ["127.0.0.1:7890 TCP", "监听中" if listeners.get("tcp_127_0_0_1_7890") else "未监听"],
+    ]
+
+    client_details = []
+    proxy_clients = data.get("proxy_clients", [])
+    if isinstance(proxy_clients, list):
+        for client in proxy_clients:
+            if not isinstance(client, dict):
+                continue
+            processes = client.get("processes", [])
+            paths = client.get("paths", [])
+            configs = client.get("configs", [])
+            summary_rows = [
+                ["进程线索", esc(", ".join(str(item) for item in processes) if isinstance(processes, list) and processes else "未发现")],
+                ["配置路径", esc(", ".join(str(item) for item in paths) if isinstance(paths, list) and paths else "未发现")],
+            ]
+            config_blocks = []
+            if isinstance(configs, list):
+                for config in configs:
+                    if not isinstance(config, dict):
+                        continue
+                    excerpt = "\n".join(str(line) for line in config.get("excerpt", []))
+                    config_blocks.append(
+                        f"""
+                        <details class="details-block">
+                          <summary>{html.escape(str(config.get("path") or "配置文件"))}</summary>
+                          <pre>{html.escape(excerpt)}</pre>
+                        </details>
+                        """
+                    )
+            client_details.append(
+                f"""
+                <article class="evidence">
+                  <h3>{html.escape(str(client.get("name") or "代理客户端"))}</h3>
+                  {render_table(summary_rows, "暂无客户端线索。")}
+                  {"".join(config_blocks)}
+                </article>
+                """
+            )
+    if not client_details:
+        client_details.append(
+            '<article class="evidence"><h3>未发现已知客户端</h3><p class="empty">仍会继续基于系统代理、路由、DNS、出口和浏览器结果进行通用审计。</p></article>'
+        )
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>网络环境指纹审计报告</title>
+  <style>
+    :root {{
+      --bg: #f5f1ea;
+      --surface: #fffdf8;
+      --surface-2: #f9f6ef;
+      --ink: #1f2933;
+      --muted: #64707d;
+      --line: #ded7ca;
+      --line-strong: #c9bca9;
+      --accent: #176b87;
+      --accent-2: #8f4b2e;
+      --high: #bd2d2d;
+      --medium: #a86913;
+      --low: #34785f;
+      --info: #526b8e;
+      --stable: #2f7a5f;
+      --shadow: 0 18px 48px rgba(40, 33, 24, 0.09);
+    }}
+    * {{ box-sizing: border-box; }}
+    html {{ scroll-behavior: smooth; }}
+    body {{
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: Inter, "Avenir Next", "Segoe UI", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.5;
+    }}
+    a {{ color: inherit; }}
+    .nav-toggle, .nav-button, .nav-backdrop {{
+      display: none;
+    }}
+    .shell {{
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+    }}
+    .rail {{
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 22px 18px;
+      background: #18232b;
+      color: #f8f4ec;
+      border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }}
+    .brand {{
+      display: grid;
+      gap: 8px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+    }}
+    .brand span {{
+      color: #9ccbd8;
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }}
+    .brand strong {{
+      font-size: 22px;
+      line-height: 1.12;
+    }}
+    .nav {{
+      display: grid;
+      gap: 6px;
+      margin-top: 18px;
+    }}
+    .nav a {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 11px;
+      border-radius: 8px;
+      color: rgba(248, 244, 236, 0.82);
+      text-decoration: none;
+      font-size: 13px;
+    }}
+    .nav a:hover {{
+      background: rgba(255, 255, 255, 0.08);
+      color: #fffdf8;
+    }}
+    .nav em {{
+      color: rgba(248, 244, 236, 0.55);
+      font-style: normal;
+      font-size: 12px;
+    }}
+    main {{
+      width: min(1180px, 100%);
+      padding: 28px 32px 48px;
+    }}
+    .summary {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 260px;
+      gap: 22px;
+      align-items: stretch;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .eyebrow {{
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }}
+    h1, h2, h3, p {{ margin-top: 0; }}
+    h1 {{
+      margin-bottom: 12px;
+      font-size: 36px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }}
+    .summary p {{
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 15px;
+      margin-bottom: 0;
+    }}
+    .verdict {{
+      display: grid;
+      align-content: center;
+      gap: 12px;
+      padding: 20px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }}
+    .score {{
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }}
+    .score strong {{
+      font-size: 46px;
+      line-height: 1;
+    }}
+    .score span {{ color: var(--muted); }}
+    .status {{
+      display: inline-flex;
+      width: fit-content;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+    .status-critical {{ color: #fff; background: var(--high); }}
+    .status-review {{ color: #fff; background: var(--medium); }}
+    .status-stable {{ color: #fff; background: var(--stable); }}
+    .metrics {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }}
+    .metric, .signal, .finding, .action-item, .evidence {{
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(40, 33, 24, 0.05);
+    }}
+    .metric {{
+      min-height: 112px;
+      padding: 15px;
+      display: grid;
+      align-content: space-between;
+      gap: 10px;
+    }}
+    .metric span, .signal span {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }}
+    .metric strong {{
+      font-size: 22px;
+      line-height: 1.12;
+      word-break: break-word;
+    }}
+    small {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }}
+    section {{
+      margin-top: 28px;
+    }}
+    .section-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .section-head h2 {{
+      margin: 0;
+      font-size: 22px;
+    }}
+    .section-head span {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }}
+    .signals {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .signal {{
+      padding: 14px;
+      border-left: 5px solid var(--line-strong);
+    }}
+    .signal strong {{
+      display: block;
+      margin: 8px 0 3px;
+      font-size: 17px;
+      word-break: break-word;
+    }}
+    .signal-high {{ border-left-color: var(--high); }}
+    .signal-medium {{ border-left-color: var(--medium); }}
+    .signal-ok {{
+      color: #586470;
+      background: #f2efe8;
+      border-color: #e0d8cb;
+      border-left-color: #b7aea0;
+      box-shadow: none;
+    }}
+    .signal-high strong {{ color: var(--high); }}
+    .signal-medium strong {{ color: #7b4a0d; }}
+    .signal-ok strong {{ color: #53606b; }}
+    .findings-grid {{
+      display: grid;
+      gap: 10px;
+    }}
+    .finding {{
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr);
+      gap: 14px;
+      padding: 16px;
+      border-left: 6px solid var(--info);
+    }}
+    .finding-high {{ border-left-color: var(--high); }}
+    .finding-medium {{ border-left-color: var(--medium); }}
+    .finding-low {{ border-left-color: var(--low); }}
+    .finding-info {{
+      color: #55616d;
+      background: #f2efe8;
+      border-color: #dfd7c9;
+      border-left-color: #9aa5ae;
+      box-shadow: none;
+    }}
+    .finding-stable {{ border-left-color: var(--stable); }}
+    .finding-index {{
+      color: var(--muted);
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 13px;
+      padding-top: 2px;
+    }}
+    .finding h3, .action-item h3 {{
+      margin: 5px 0 6px;
+      font-size: 17px;
+    }}
+    .finding-high h3 {{
+      color: #8e1f1f;
+      font-weight: 900;
+    }}
+    .finding-medium h3 {{
+      color: #73470f;
+      font-weight: 850;
+    }}
+    .finding-info h3 {{
+      color: #46525e;
+      font-weight: 700;
+    }}
+    .finding p, .action-item p {{
+      margin: 0;
+      color: var(--muted);
+    }}
+    .pill, .priority {{
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }}
+    .pill-high {{ color: var(--high); background: rgba(189, 45, 45, 0.1); }}
+    .pill-medium {{ color: var(--medium); background: rgba(168, 105, 19, 0.12); }}
+    .pill-low {{ color: var(--low); background: rgba(52, 120, 95, 0.12); }}
+    .pill-info {{ color: var(--info); background: rgba(82, 107, 142, 0.12); }}
+    .actions-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+    }}
+    .action-item {{
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 12px;
+      padding: 15px;
+    }}
+    .priority {{
+      height: fit-content;
+      color: #fff;
+      background: var(--accent);
+    }}
+    .evidence-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }}
+    .evidence {{
+      padding: 16px;
+    }}
+    .evidence h3 {{
+      margin-bottom: 12px;
+      font-size: 16px;
+    }}
+    .kv-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    .kv-table th {{
+      width: 34%;
+      padding: 10px 12px 10px 0;
+      color: var(--muted);
+      font-weight: 700;
+      text-align: left;
+      vertical-align: top;
+      border-top: 1px solid var(--line);
+    }}
+    .kv-table td {{
+      padding: 10px 0;
+      vertical-align: top;
+      border-top: 1px solid var(--line);
+      word-break: break-word;
+    }}
+    code {{
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      padding: 2px 5px;
+      border-radius: 6px;
+      background: #ebe4d8;
+      word-break: break-all;
+    }}
+    .details-block {{
+      padding: 14px 16px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    .details-block + .details-block {{ margin-top: 10px; }}
+    .details-block summary {{
+      cursor: pointer;
+      font-weight: 700;
+    }}
+    .details-block pre {{
+      margin: 12px 0 0;
+      padding: 14px;
+      border-radius: 8px;
+      color: #f4efe5;
+      background: #18232b;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.55;
+    }}
+    .empty {{
+      margin: 0;
+      color: var(--muted);
+    }}
+    @media (max-width: 1040px) {{
+      .shell {{ grid-template-columns: 1fr; }}
+      .summary {{ grid-template-columns: 1fr; }}
+      .metrics, .signals, .evidence-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    }}
+    @media (max-width: 720px) {{
+      .nav-button {{
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        z-index: 40;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 58px;
+        height: 38px;
+        padding: 0 12px;
+        border-radius: 999px;
+        color: #f8f4ec;
+        background: #18232b;
+        box-shadow: 0 10px 28px rgba(24, 35, 43, 0.24);
+        font-size: 13px;
+        font-weight: 800;
+      }}
+      .nav-backdrop {{
+        position: fixed;
+        inset: 0;
+        z-index: 25;
+        background: rgba(24, 35, 43, 0.42);
+      }}
+      .nav-toggle:checked + .nav-button + .nav-backdrop {{
+        display: block;
+      }}
+      .rail {{
+        position: fixed;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        z-index: 35;
+        width: min(292px, 84vw);
+        height: 100vh;
+        padding: 64px 16px 18px;
+        transform: translateX(-102%);
+        transition: transform 180ms ease;
+        box-shadow: 18px 0 40px rgba(24, 35, 43, 0.26);
+      }}
+      .nav-toggle:checked ~ .shell .rail {{ transform: translateX(0); }}
+      .brand {{
+        padding-bottom: 10px;
+      }}
+      .brand strong {{
+        font-size: 18px;
+      }}
+      .nav {{
+        grid-template-columns: 1fr;
+        gap: 6px;
+        margin-top: 14px;
+      }}
+      .nav a {{
+        padding: 11px;
+        font-size: 13px;
+      }}
+      .nav em {{
+        display: inline;
+      }}
+      main {{ padding: 62px 14px 36px; }}
+      h1 {{ font-size: 29px; }}
+      .metrics, .signals, .evidence-grid {{ grid-template-columns: 1fr; }}
+      .finding {{ grid-template-columns: 1fr; }}
+      .kv-table th, .kv-table td {{
+        display: block;
+        width: 100%;
+        padding: 8px 0;
+      }}
+      .kv-table td {{ border-top: 0; padding-top: 0; }}
+    }}
+  </style>
+</head>
+<body>
+  <input class="nav-toggle" id="nav-toggle" type="checkbox">
+  <label class="nav-button" for="nav-toggle">目录</label>
+  <label class="nav-backdrop" for="nav-toggle"></label>
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand">
+        <span>Network Audit</span>
+        <strong>网络环境<br>指纹审计</strong>
+      </div>
+      <nav class="nav">
+        <a href="#summary">摘要 <em>{risk_score}</em></a>
+        <a href="#signals">关键证据 <em>{len(observed_ips) if isinstance(observed_ips, list) else 0}</em></a>
+        <a href="#findings">主要发现 <em>{total_findings}</em></a>
+        <a href="#actions">修复建议 <em>{len(recommendations)}</em></a>
+        <a href="#evidence">证据明细 <em>{len(candidates)}</em></a>
+        <a href="#proxy">代理配置 <em>{esc(active_network.get("interface"))}</em></a>
+      </nav>
+    </aside>
+    <main>
+      <header class="summary" id="summary">
+        <div>
+          <p class="eyebrow">Audit Summary</p>
+          <h1>环境一致性报告</h1>
+          <p>{html.escape(posture[2])}</p>
+          <div class="metrics">
+            {metric("公网出口", public_summary.get("ip") or "未知", str(public_summary.get("asn_org") or "ASN 未知"))}
+            {metric("WebRTC 暴露", webrtc_result, webrtc_detail)}
+            {metric("DNS 解析器", len(dns_nameservers), ", ".join(str(item) for item in dns_nameservers[:2]) or "未发现")}
+            {metric("浏览器 Profile", profile_count, active_language)}
+          </div>
+        </div>
+        <aside class="verdict">
+          <span class="status status-{html.escape(posture[1])}">{html.escape(posture[0])}</span>
+          <div class="score"><strong>{risk_score}</strong><span>/100</span></div>
+          <small>高风险 {high_count}，中风险 {medium_count}，低风险 {low_count}，信息项 {info_count}</small>
+        </aside>
+      </header>
+
+      <section id="signals">
+        <div class="section-head">
+          <h2>关键证据</h2>
+          <span>scan first</span>
+        </div>
+        <div class="signals">
+          {signal("出口情报", ip_risk_brief, "high" if high_count else "ok", str(public_summary.get("asn_org") or ""))}
+          {signal("WebRTC 暴露", webrtc_result, "medium" if private_candidates else "ok", f"公网 {public_candidates} / 本机内网 {private_candidates} / 匿名地址 {mdns_candidates}" if browser_probe_status == "ok" else webrtc_detail)}
+          {signal("语言信号", active_language, "medium" if any("Accept-Language" in str(item.get("title") or "") for item in findings) else "ok", str(locale.get("apple_locale") or ""))}
+          {signal("DNS", ", ".join(str(item) for item in dns_nameservers) or "未知", "medium" if any("DNS" in str(item.get("title") or "") for item in findings) else "ok", str(active_network.get("service") or ""))}
+          {signal("代理路径", active_network.get("interface") or "未知", "ok", str(networksetup.get("service") or ""))}
+          {signal("本地监听", f"DNS {'on' if listeners.get('tcp_127_0_0_1_53') or listeners.get('udp_127_0_0_1_53') else 'off'} / 7890 {'on' if listeners.get('tcp_127_0_0_1_7890') else 'off'}", "ok", "localhost")}
+        </div>
+      </section>
+
+      <section id="findings">
+        <div class="section-head">
+          <h2>主要发现</h2>
+          <span>{total_findings} findings</span>
+        </div>
+        <div class="findings-grid">
+          {finding_summary}
+        </div>
+      </section>
+
+      <section id="actions">
+        <div class="section-head">
+          <h2>修复建议</h2>
+          <span>{len(recommendations)} actions</span>
+        </div>
+        <div class="actions-grid">
+          {action_summary}
+        </div>
+      </section>
+
+      <section id="evidence">
+        <div class="section-head">
+          <h2>证据明细</h2>
+          <span>structured evidence</span>
+        </div>
+        <div class="evidence-grid">
+          <article class="evidence">
+            <h3>出口 / DNS / 区域</h3>
+            {render_table(network_rows, "暂无网络信号数据。")}
+          </article>
+          <article class="evidence">
+            <h3>浏览器探针</h3>
+            {render_table(browser_rows, "浏览器探针暂无数据。")}
+          </article>
+          <article class="evidence">
+            <h3>WebRTC 地址明细</h3>
+            {render_table(webrtc_rows, "未采集到 WebRTC 地址。")}
+          </article>
+          <article class="evidence">
+            <h3>系统语言与区域</h3>
+            {render_table(locale_rows, "暂无语言区域数据。")}
+          </article>
+        </div>
+      </section>
+
+      <section id="proxy">
+        <div class="section-head">
+          <h2>代理与路由</h2>
+          <span>system path</span>
+        </div>
+        <div class="evidence-grid">
+          <article class="evidence">
+            <h3>系统代理</h3>
+            {render_table(proxy_rows, "暂无代理设置数据。")}
+          </article>
+          <article class="evidence">
+            <h3>路由与本地监听</h3>
+            {render_table(route_rows, "暂无路由或监听数据。")}
+          </article>
+        </div>
+      </section>
+
+      <section id="runtime">
+        <div class="section-head">
+          <h2>代理客户端识别</h2>
+          <span>{len(proxy_clients) if isinstance(proxy_clients, list) else 0} clients</span>
+        </div>
+        <div class="evidence-grid">
+          {"".join(client_details)}
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
+"""
+
+
 def write_reports(data: dict[str, object], output_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -2055,7 +3654,7 @@ def open_report(html_path: pathlib.Path) -> dict[str, object]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Audit macOS network and locale signals.")
+    parser = argparse.ArgumentParser(description="Audit macOS and Windows network and locale signals.")
     parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_REPORTS_DIR),
@@ -2082,8 +3681,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if sys.platform != "darwin":
-        print("This tool currently supports macOS only.", file=sys.stderr)
+    if sys.platform not in {"darwin", "win32"}:
+        print("This tool currently supports macOS and Windows only.", file=sys.stderr)
         return 2
 
     data = collect_data(
