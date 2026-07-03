@@ -235,6 +235,13 @@ malformed
             brief["manual_agent_checks"]["claude_code_local_config"]["risk_level"],
             "high_if_non_official_trace_found",
         )
+        self.assertTrue(
+            brief["manual_agent_checks"]["claude_code_local_config"]["consent_required"]
+        )
+        self.assertIn(
+            "Do you want me to inspect local Claude Code settings and session metadata",
+            brief["manual_agent_checks"]["claude_code_local_config"]["consent_prompt"],
+        )
         self.assertIn(
             "~/.claude/settings.json",
             brief["manual_agent_checks"]["claude_code_local_config"]["paths_to_review"],

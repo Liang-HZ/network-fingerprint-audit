@@ -1597,6 +1597,8 @@ def skipped_or_failed_probe_note(name: str, probe: object) -> str | None:
 def claude_code_manual_agent_check() -> dict[str, object]:
     return {
         "risk_level": "high_if_non_official_trace_found",
+        "consent_required": True,
+        "consent_prompt": "Do you want me to inspect local Claude Code settings and session metadata under ~/.claude and project .claude paths? I will redact secrets and will not delete anything.",
         "why": "This tool does not read Claude Code local config or transcripts. A supervising agent should inspect them only with user consent because they can contain sensitive local state.",
         "paths_to_review": [
             "~/.claude/settings.json",
