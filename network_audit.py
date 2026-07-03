@@ -6,6 +6,7 @@ import base64
 import datetime as dt
 import functools
 import html
+import http.client
 import http.server
 import ipaddress
 import json
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +26,18 @@ import urllib.request
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 DEFAULT_REPORTS_DIR = PROJECT_ROOT / "reports"
 BROWSER_PROBE_TEMPLATE = PROJECT_ROOT / "browser_probe.html"
+
+TRACKING_PROBE_HEADER_NAMES = (
+    "User-Agent",
+    "Accept-Language",
+    "DNT",
+    "Sec-GPC",
+    "Referer",
+    "Cookie",
+    "Sec-CH-UA",
+    "Sec-CH-UA-Mobile",
+    "Sec-CH-UA-Platform",
+)
 
 CN_DNS_HINTS = {
     "114.114.114.114",
@@ -753,6 +767,283 @@ def start_probe_server(directory: pathlib.Path) -> tuple[http.server.ThreadingHT
     return server, thread
 
 
+def tracking_probe_purpose(path: str) -> str:
+    if path in {"/", "/tracking-probe.html"}:
+        return "probe-page"
+    if path == "/track/open.gif":
+        return "email-open-pixel"
+    if path == "/track/style.css":
+        return "email-style-resource"
+    if path == "/track/background.gif":
+        return "email-background-image"
+    if path == "/track/beacon":
+        return "browser-script-beacon"
+    if path == "/track/fetch":
+        return "browser-script-fetch"
+    if path == "/track/client-json":
+        return "browser-client-json"
+    if path == "/favicon.ico":
+        return "browser-favicon"
+    return "other"
+
+
+def selected_request_headers(headers: http.client.HTTPMessage) -> dict[str, str]:
+    selected: dict[str, str] = {}
+    for name in TRACKING_PROBE_HEADER_NAMES:
+        value = headers.get(name)
+        if value:
+            selected[name] = "<present>" if name == "Cookie" else value
+    return selected
+
+
+def tracking_probe_html() -> str:
+    cache_buster = str(int(time.time() * 1000))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Default Browser Tracking Probe</title>
+  <link rel="stylesheet" href="/track/style.css?cache={cache_buster}">
+</head>
+<body>
+  <img alt="" width="1" height="1" src="/track/open.gif?kind=open-pixel&cache={cache_buster}">
+  <script>
+    (() => {{
+      const payload = {{
+        collectedAt: new Date().toISOString(),
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        languages: navigator.languages,
+        platform: navigator.platform,
+        webdriver: navigator.webdriver,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        doNotTrack: navigator.doNotTrack,
+        globalPrivacyControl: navigator.globalPrivacyControl === true,
+        cookieEnabled: navigator.cookieEnabled,
+      }};
+
+      if (navigator.permissions && navigator.permissions.query) {{
+        navigator.permissions.query({{ name: "geolocation" }})
+          .then((permission) => {{
+            payload.geolocationPermission = permission.state;
+            sendPayload(payload);
+          }})
+          .catch(() => sendPayload(payload));
+      }} else {{
+        sendPayload(payload);
+      }}
+
+      function sendPayload(body) {{
+        const encoded = JSON.stringify(body);
+        if (navigator.sendBeacon) {{
+          navigator.sendBeacon("/track/beacon?kind=sendBeacon&cache={cache_buster}", encoded);
+        }}
+        fetch("/track/fetch?kind=fetch&cache={cache_buster}", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: encoded,
+          cache: "no-store",
+          credentials: "same-origin",
+        }}).catch(() => {{}});
+        fetch("/track/client-json?kind=client-json&cache={cache_buster}", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: encoded,
+          cache: "no-store",
+          credentials: "same-origin",
+        }}).catch(() => {{}});
+      }}
+    }})();
+  </script>
+</body>
+</html>
+"""
+
+
+def make_tracking_probe_handler(
+    requests_log: list[dict[str, object]],
+) -> type[http.server.BaseHTTPRequestHandler]:
+    one_pixel_gif = base64.b64decode("R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==")
+
+    class TrackingProbeHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def record_request(self) -> bytes:
+            length_raw = self.headers.get("Content-Length") or "0"
+            try:
+                length = int(length_raw)
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length) if length else b""
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            requests_log.append(
+                {
+                    "at": dt.datetime.now().astimezone().isoformat(),
+                    "method": self.command,
+                    "path": parsed.path,
+                    "query": {key: values for key, values in query.items()},
+                    "purpose": tracking_probe_purpose(parsed.path),
+                    "client_ip": self.client_address[0],
+                    "headers": selected_request_headers(self.headers),
+                    "body_excerpt": body.decode("utf-8", errors="replace")[:1200],
+                }
+            )
+            return body
+
+        def do_GET(self) -> None:
+            self.record_request()
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in {"/", "/tracking-probe.html"}:
+                payload = tracking_probe_html().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if parsed.path == "/track/style.css":
+                payload = b'body{background-image:url("/track/background.gif?kind=css-background");}'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/css; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if parsed.path in {"/track/open.gif", "/track/background.gif"}:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/gif")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(one_pixel_gif)
+                return
+            if parsed.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self) -> None:
+            self.record_request()
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+    return TrackingProbeHandler
+
+
+def start_tracking_probe_server() -> tuple[
+    http.server.ThreadingHTTPServer,
+    threading.Thread,
+    list[dict[str, object]],
+]:
+    requests_log: list[dict[str, object]] = []
+    handler = make_tracking_probe_handler(requests_log)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, requests_log
+
+
+def open_default_browser_url(url: str) -> dict[str, object]:
+    if sys.platform == "darwin":
+        result = run_command("open", url, timeout=10)
+        return {"ok": not command_failed(result), "method": "open", "command": result}
+    if sys.platform == "win32":
+        result = run_command("cmd", "/c", "start", "", url, timeout=10)
+        return {"ok": not command_failed(result), "method": "cmd-start", "command": result}
+    return {"ok": False, "method": "unsupported", "reason": "Default browser tracking probe supports macOS and Windows only."}
+
+
+def default_browser_tracking_result_label(probe: dict[str, object]) -> str:
+    status = str(probe.get("status") or "")
+    if status == "skipped":
+        return "未检测"
+    if status == "unavailable":
+        return "不可用"
+    if status == "error":
+        return "检测失败"
+    if status != "ok":
+        return "未知"
+
+    requests = probe.get("requests", [])
+    if not isinstance(requests, list):
+        return "未知"
+    purposes = {
+        str(item.get("purpose") or "")
+        for item in requests
+        if isinstance(item, dict)
+    }
+    email_like_purposes = {
+        "email-open-pixel",
+        "email-style-resource",
+        "email-background-image",
+    }
+    if purposes.intersection(email_like_purposes):
+        return "追踪资源未被拦截"
+    return "追踪资源疑似被拦截"
+
+
+def default_browser_tracking_email_requests(probe: dict[str, object]) -> list[dict[str, object]]:
+    requests = probe.get("requests", [])
+    if not isinstance(requests, list):
+        return []
+    email_like_purposes = {
+        "email-open-pixel",
+        "email-style-resource",
+        "email-background-image",
+    }
+    return [
+        item
+        for item in requests
+        if isinstance(item, dict) and str(item.get("purpose") or "") in email_like_purposes
+    ]
+
+
+def run_default_browser_tracking_probe(
+    *,
+    skip_tracking_probe: bool,
+    open_url: object | None = None,
+    wait_seconds: float = 12.0,
+) -> dict[str, object]:
+    if skip_tracking_probe:
+        return {
+            "status": "skipped",
+            "reason": "Default browser tracking probe was skipped by configuration.",
+        }
+
+    opener = open_url if callable(open_url) else open_default_browser_url
+    server, thread, requests_log = start_tracking_probe_server()
+    probe_url = f"http://127.0.0.1:{server.server_port}/tracking-probe.html"
+    try:
+        open_result = opener(probe_url)
+        if isinstance(open_result, dict) and not open_result.get("ok", False):
+            status = "error"
+            reason = "Could not open the default browser."
+        else:
+            time.sleep(wait_seconds)
+            status = "ok"
+            reason = ""
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    result = {
+        "status": status,
+        "probe_url": probe_url,
+        "open_result": open_result if isinstance(open_result, dict) else {"ok": bool(open_result)},
+        "requests": requests_log,
+        "request_count": len(requests_log),
+        "reason": reason,
+        "note": "This probe opens the real default browser and serves email-like remote resources from 127.0.0.1. It checks whether image/CSS-style tracking resources load automatically, similar to an email client rendering remote content.",
+    }
+    result["label"] = default_browser_tracking_result_label(result)
+    return result
+
+
 def extract_probe_payload(dom: str) -> tuple[str | None, str | None, dict[str, object] | None]:
     status_match = re.search(r'data-probe-status="([^"]+)"', dom)
     error_match = re.search(r'data-probe-error="([^"]*)"', dom)
@@ -1094,6 +1385,36 @@ def make_findings(data: dict[str, object]) -> list[dict[str, str]]:
                             }
                         )
 
+    tracking_probe = data.get("default_browser_tracking_probe", {})
+    if isinstance(tracking_probe, dict) and tracking_probe.get("status") == "ok":
+        email_requests = default_browser_tracking_email_requests(tracking_probe)
+        if email_requests:
+            first_headers = (
+                email_requests[0].get("headers", {})
+                if isinstance(email_requests[0].get("headers"), dict)
+                else {}
+            )
+            accept_language = get_case_insensitive(first_headers, "Accept-Language")
+            user_agent = get_case_insensitive(first_headers, "User-Agent")
+            purpose_counts: dict[str, int] = {}
+            for item in email_requests:
+                purpose = str(item.get("purpose") or "unknown")
+                purpose_counts[purpose] = purpose_counts.get(purpose, 0) + 1
+            details = [
+                ", ".join(f"{key}={value}" for key, value in sorted(purpose_counts.items())),
+            ]
+            if accept_language:
+                details.append(f"Accept-Language={accept_language}")
+            if user_agent:
+                details.append(f"User-Agent={user_agent}")
+            findings.append(
+                {
+                    "severity": "info",
+                    "title": "Default browser loads email-like tracking resources",
+                    "detail": "; ".join(details),
+                }
+            )
+
     return findings
 
 
@@ -1159,6 +1480,16 @@ def build_recommendations(data: dict[str, object]) -> list[dict[str, str]]:
             }
         )
 
+    if "Default browser loads email-like tracking resources" in finding_titles:
+        recommendations.append(
+            {
+                "priority": "P2",
+                "area": "Default Browser Tracking",
+                "action": "If you expect mail-style tracking protection, test the same link through your real email client or a privacy-focused mail/browser setup and compare whether the pixel, CSS, and script requests disappear.",
+                "why": "Opening or previewing an email can load remote resources without a click; this probe shows whether the current default browser would allow similar automatic loads.",
+            }
+        )
+
     if "WPAD auto proxy discovery is enabled" in finding_titles:
         recommendations.append(
             {
@@ -1182,6 +1513,237 @@ def build_recommendations(data: dict[str, object]) -> list[dict[str, str]]:
     return recommendations
 
 
+def finding_agent_focus(title: str) -> str:
+    if title in {"External IP intelligence flags egress risk", "Datacenter egress detected"}:
+        return "egress_reputation"
+    if title == "System DNS points to China-oriented public resolvers":
+        return "dns_consistency"
+    if title == "Local language signals include Chinese":
+        return "locale_consistency"
+    if "Accept-Language" in title or title == "Browser probe sent Chinese Accept-Language":
+        return "browser_language"
+    if "WebRTC" in title:
+        return "webrtc_exposure"
+    if title == "Default browser loads email-like tracking resources":
+        return "remote_resource_tracking"
+    if title == "WPAD auto proxy discovery is enabled":
+        return "proxy_determinism"
+    if title == "Proxy client signatures detected":
+        return "proxy_client_presence"
+    if title == "Required data collection failed":
+        return "collection_integrity"
+    return "general_environment_signal"
+
+
+def finding_evidence_paths(title: str) -> list[str]:
+    mapping = {
+        "External IP intelligence flags egress risk": [
+            "public_ip.ipapi_is",
+            "public_ip.proxycheck",
+            "public_ip.observed_ips",
+        ],
+        "Datacenter egress detected": ["public_ip.ipinfo", "public_ip.ifconfig"],
+        "System DNS points to China-oriented public resolvers": ["dns.nameservers", "dns.wifi_dns_raw"],
+        "Local language signals include Chinese": ["locale"],
+        "Browser probe sent Chinese Accept-Language": ["browser_probe.result.headerEcho.headers"],
+        "Browser WebRTC exposes private host candidates": ["browser_probe.result.webrtc.candidates"],
+        "Browser WebRTC local addresses are obfuscated with mDNS": ["browser_probe.result.webrtc.candidates"],
+        "Browser WebRTC public candidate differs from HTTP egress IP": [
+            "browser_probe.result.webrtc.candidates",
+            "public_ip",
+        ],
+        "Default browser loads email-like tracking resources": [
+            "default_browser_tracking_probe.requests",
+        ],
+        "WPAD auto proxy discovery is enabled": ["proxy", "networksetup.auto_proxy_discovery"],
+        "Proxy client signatures detected": ["proxy_clients"],
+        "Local DNS interception appears active": ["clash.configs", "listeners"],
+        "Required data collection failed": ["collection_errors", "raw_command_status"],
+    }
+    if "profile exposes Chinese Accept-Language" in title:
+        return ["browser_languages"]
+    return mapping.get(title, ["findings"])
+
+
+def risk_counts(findings: list[dict[str, object]]) -> dict[str, int]:
+    counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
+    for item in findings:
+        severity = str(item.get("severity") or "info")
+        if severity in counts:
+            counts[severity] += 1
+    return counts
+
+
+def overall_level_from_counts(counts: dict[str, int]) -> str:
+    if counts["high"]:
+        return "high"
+    if counts["medium"]:
+        return "medium"
+    if counts["low"]:
+        return "low"
+    return "informational"
+
+
+def skipped_or_failed_probe_note(name: str, probe: object) -> str | None:
+    if not isinstance(probe, dict):
+        return f"{name}: missing"
+    status = str(probe.get("status") or "")
+    if status in {"ok", ""}:
+        return None
+    reason = str(probe.get("reason") or probe.get("page_error") or "")
+    return f"{name}: {status}" + (f" ({reason})" if reason else "")
+
+
+def claude_code_manual_agent_check() -> dict[str, object]:
+    return {
+        "risk_level": "high_if_non_official_trace_found",
+        "why": "This tool does not read Claude Code local config or transcripts. A supervising agent should inspect them only with user consent because they can contain sensitive local state.",
+        "paths_to_review": [
+            "~/.claude/settings.json",
+            "<project>/.claude/settings.json",
+            "<project>/.claude/settings.local.json",
+            "~/.claude/projects/<related-project>/",
+        ],
+        "env_vars_to_review": [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "apiKeyHelper",
+        ],
+        "high_risk_traces": [
+            "unknown ANTHROPIC_BASE_URL or relay domain",
+            "third-party Claude Code mirror or relay subscription",
+            "shared subscription or transfer-station wording",
+            "non-Anthropic model ID in Claude Code settings or sessions",
+            "gateway model aliases that are not clearly an official organization/cloud-provider setup",
+            "session transcripts showing non-official Claude Code model or endpoint use",
+        ],
+        "cleanup_guidance": [
+            "back up .claude before deleting suspicious settings or sessions",
+            "remove suspicious env entries from user/project/local settings after backup",
+            "remove related ~/.claude/projects session cache after backup if it contains non-official traces",
+            "re-login through official Claude Code or an explicitly authorized organization/cloud-provider path",
+        ],
+    }
+
+
+def low_risk_profile_contract() -> dict[str, object]:
+    return {
+        "interpretation": "Lower observed account-trust/environment risk, not a guarantee.",
+        "required_conditions": [
+            "egress IP is outside mainland China and in a supported region",
+            "IP country, system timezone, browser timezone, and DNS geography are consistent",
+            "no mainland China locale, language, resolver, or browser profile trace",
+            "no WebRTC private host leak or public WebRTC egress mismatch",
+            "no proxy/VPN/datacenter abuse flags from structured IP intelligence",
+            "no non-official Claude Code config/session traces",
+        ],
+    }
+
+
+def build_agent_brief(data: dict[str, object]) -> dict[str, object]:
+    findings = [item for item in data.get("findings", []) if isinstance(item, dict)]
+    recommendations = [
+        item for item in data.get("recommendations", []) if isinstance(item, dict)
+    ]
+    counts = risk_counts(findings)
+    public_ip = data.get("public_ip", {}) if isinstance(data.get("public_ip"), dict) else {}
+    public_summary = public_ip_summary(public_ip)
+    tracking_probe = (
+        data.get("default_browser_tracking_probe", {})
+        if isinstance(data.get("default_browser_tracking_probe"), dict)
+        else {}
+    )
+
+    top_factors: list[dict[str, object]] = []
+    severity_rank = {"high": 0, "medium": 1, "low": 2, "info": 3}
+    sorted_findings = sorted(
+        findings,
+        key=lambda item: severity_rank.get(str(item.get("severity") or "info"), 4),
+    )
+    for item in sorted_findings:
+        title = str(item.get("title") or "")
+        top_factors.append(
+            {
+                "severity": str(item.get("severity") or "info"),
+                "title": title,
+                "detail": str(item.get("detail") or ""),
+                "agent_focus": finding_agent_focus(title),
+                "evidence_paths": finding_evidence_paths(title),
+            }
+        )
+
+    unverified_or_failed_checks = [
+        str(item)
+        for item in data.get("collection_errors", [])
+        if item
+    ] if isinstance(data.get("collection_errors", []), list) else []
+    for note in (
+        skipped_or_failed_probe_note("browser_probe", data.get("browser_probe")),
+        skipped_or_failed_probe_note(
+            "default_browser_tracking_probe",
+            data.get("default_browser_tracking_probe"),
+        ),
+    ):
+        if note:
+            unverified_or_failed_checks.append(note)
+
+    return {
+        "schema_version": "agent-brief-v1",
+        "purpose": "account_trust_environment_diagnostics",
+        "overall_level": overall_level_from_counts(counts),
+        "risk_counts": counts,
+        "top_factors": top_factors,
+        "egress": {
+            "ip": public_summary.get("ip"),
+            "observed_ips": public_summary.get("observed_ips", []),
+            "asn_org": public_summary.get("asn_org"),
+            "country": public_summary.get("country"),
+            "timezone": public_summary.get("timezone"),
+            "ipapi_flags": public_summary.get("ipapi_flags"),
+            "proxycheck_flags": public_summary.get("proxycheck_flags"),
+        },
+        "tracking_probe": {
+            "status": tracking_probe.get("status"),
+            "label": default_browser_tracking_result_label(tracking_probe),
+            "email_like_request_count": len(default_browser_tracking_email_requests(tracking_probe)),
+            "request_count": tracking_probe.get("request_count"),
+        },
+        "unverified_or_failed_checks": unverified_or_failed_checks,
+        "manual_agent_checks": {
+            "claude_code_local_config": claude_code_manual_agent_check(),
+        },
+        "low_risk_profile": low_risk_profile_contract(),
+        "next_actions": [
+            {
+                "priority": str(item.get("priority") or ""),
+                "area": str(item.get("area") or ""),
+                "action": str(item.get("action") or ""),
+                "why": str(item.get("why") or ""),
+            }
+            for item in recommendations
+        ],
+        "agent_instructions": [
+            "Use this brief to diagnose risk factors and false-positive triggers in the local environment.",
+            "Do not describe this as a way to bypass enforcement; frame conclusions as account trust and environment consistency diagnostics.",
+            "Cite evidence_paths when explaining each factor, and call out unverified_or_failed_checks before making strong claims.",
+        ],
+    }
+
+
+def attach_analysis_fields(data: dict[str, object]) -> None:
+    data["findings"] = make_findings(data)
+    data["recommendations"] = build_recommendations(data)
+    data["agent_brief"] = build_agent_brief(data)
+
+
 def collect_public_ip(skip_network: bool) -> dict[str, object]:
     public_ip: dict[str, object] = {}
     if skip_network:
@@ -1203,6 +1765,7 @@ def collect_macos_data(
     skip_network: bool,
     skip_browser_probe: bool,
     browser_path: str | None,
+    run_tracking_probe: bool = False,
 ) -> dict[str, object]:
     now = dt.datetime.now().astimezone()
 
@@ -1268,6 +1831,10 @@ def collect_macos_data(
     if skip_network and browser_probe.get("status") == "skipped":
         browser_probe["reason"] = "Browser probe was skipped because --skip-network was set."
 
+    default_browser_tracking_probe = run_default_browser_tracking_probe(
+        skip_tracking_probe=not run_tracking_probe,
+    )
+
     data: dict[str, object] = {
         "generated_at": now.isoformat(),
         "host": {
@@ -1300,6 +1867,7 @@ def collect_macos_data(
         },
         "browser_languages": browser_languages,
         "browser_probe": browser_probe,
+        "default_browser_tracking_probe": default_browser_tracking_probe,
         "networksetup": {
             "service": active_service,
             "web_proxy": parse_key_value_block(str(wifi_webproxy_raw.get("stdout", ""))),
@@ -1322,8 +1890,7 @@ def collect_macos_data(
             "processes": process_raw,
         },
     }
-    data["findings"] = make_findings(data)
-    data["recommendations"] = build_recommendations(data)
+    attach_analysis_fields(data)
     return data
 
 
@@ -1344,6 +1911,7 @@ def collect_windows_data(
     skip_network: bool,
     skip_browser_probe: bool,
     browser_path: str | None,
+    run_tracking_probe: bool = False,
 ) -> dict[str, object]:
     now = dt.datetime.now().astimezone()
 
@@ -1402,6 +1970,10 @@ def collect_windows_data(
     )
     if skip_network and browser_probe.get("status") == "skipped":
         browser_probe["reason"] = "Browser probe was skipped because --skip-network was set."
+
+    default_browser_tracking_probe = run_default_browser_tracking_probe(
+        skip_tracking_probe=not run_tracking_probe,
+    )
 
     raw_command_status = {
         "ipconfig": ipconfig_raw,
@@ -1474,6 +2046,7 @@ def collect_windows_data(
         },
         "browser_languages": browser_languages,
         "browser_probe": browser_probe,
+        "default_browser_tracking_probe": default_browser_tracking_probe,
         "networksetup": {
             "service": "Windows",
             "web_proxy": windows_proxy,
@@ -1486,8 +2059,7 @@ def collect_windows_data(
         "proxy_clients": proxy_clients,
         "raw_command_status": raw_command_status,
     }
-    data["findings"] = make_findings(data)
-    data["recommendations"] = build_recommendations(data)
+    attach_analysis_fields(data)
     return data
 
 
@@ -1496,18 +2068,21 @@ def collect_data(
     skip_network: bool,
     skip_browser_probe: bool,
     browser_path: str | None,
+    run_tracking_probe: bool = False,
 ) -> dict[str, object]:
     if sys.platform == "darwin":
         return collect_macos_data(
             skip_network=skip_network,
             skip_browser_probe=skip_browser_probe,
             browser_path=browser_path,
+            run_tracking_probe=run_tracking_probe,
         )
     if sys.platform == "win32":
         return collect_windows_data(
             skip_network=skip_network,
             skip_browser_probe=skip_browser_probe,
             browser_path=browser_path,
+            run_tracking_probe=run_tracking_probe,
         )
     raise RuntimeError("This tool currently supports macOS and Windows only.")
 
@@ -1638,6 +2213,11 @@ def localize_finding(item: dict[str, object]) -> tuple[str, str]:
             "浏览器 WebRTC 公网候选与 HTTP 出口不一致",
             detail.replace("HTTP egress=", "HTTP 出口=").replace("; WebRTC srflx=", "；WebRTC srflx="),
         )
+    if title == "Default browser loads email-like tracking resources":
+        return (
+            "默认浏览器会加载类似邮件追踪的远程资源",
+            detail.replace("; ", "；"),
+        )
     return (title, detail)
 
 
@@ -1669,6 +2249,11 @@ def localize_recommendation(item: dict[str, object]) -> tuple[str, str, str, str
             "WebRTC 暴露面",
             "确认你真正使用的浏览器已经开启本地 IP 混淆，再重新跑探针，直到 host 候选不再暴露原始私网地址。",
             "WebRTC 是少数可能绕开普通 HTTP 代理语义、单独暴露本地网络信息的路径。",
+        ),
+        "Default Browser Tracking": (
+            "默认浏览器追踪模拟",
+            "如果你期望邮件式追踪保护，请用真实邮件客户端或隐私浏览器重复测试，并对比像素、CSS 和脚本请求是否消失。",
+            "打开或预览邮件就可能自动加载远程资源；这个探针用于观察当前默认浏览器是否允许类似自动加载。",
         ),
         "Proxy Determinism": (
             "代理确定性",
@@ -1864,6 +2449,25 @@ def render_markdown(data: dict[str, object]) -> str:
                         lines.append(
                             f"  - {candidate.get('candidateType')} | {candidate.get('protocol')} | {candidate.get('address')}:{candidate.get('port')}"
                         )
+
+    tracking_probe = data.get("default_browser_tracking_probe", {})
+    if isinstance(tracking_probe, dict):
+        lines.extend(["", "## 默认浏览器追踪模拟", ""])
+        lines.append(f"- 结论：{default_browser_tracking_result_label(tracking_probe)}")
+        lines.append(f"- 状态：{probe_status_label(str(tracking_probe.get('status') or ''))}")
+        if tracking_probe.get("reason"):
+            lines.append(f"- 说明：{tracking_probe.get('reason')}")
+        lines.append(f"- 请求数量：{tracking_probe.get('request_count') or 0}")
+        lines.append("- 模型：打开页面即自动加载 1x1 图片、CSS 背景图，并补充记录浏览器脚本 beacon/fetch。")
+        requests = tracking_probe.get("requests", [])
+        if isinstance(requests, list):
+            for request in requests:
+                if not isinstance(request, dict):
+                    continue
+                headers = request.get("headers", {}) if isinstance(request.get("headers"), dict) else {}
+                lines.append(
+                    f"  - {request.get('purpose')} | {request.get('method')} {request.get('path')} | UA={headers.get('User-Agent') or '缺失'} | Accept-Language={headers.get('Accept-Language') or '缺失'} | DNT={headers.get('DNT') or '缺失'} | GPC={headers.get('Sec-GPC') or '缺失'}"
+                )
 
     networksetup = data.get("networksetup", {})
     if isinstance(networksetup, dict):
@@ -2765,6 +3369,16 @@ def render_html(data: dict[str, object]) -> str:
     webrtc = probe_result.get("webrtc", {}) if isinstance(probe_result.get("webrtc"), dict) else {}
     candidates = webrtc.get("candidates", []) if isinstance(webrtc.get("candidates"), list) else []
     browser_probe_status = str(browser_probe.get("status") or "unknown")
+    tracking_probe = (
+        data.get("default_browser_tracking_probe", {})
+        if isinstance(data.get("default_browser_tracking_probe"), dict)
+        else {}
+    )
+    tracking_probe_label = default_browser_tracking_result_label(tracking_probe)
+    tracking_probe_requests = (
+        tracking_probe.get("requests", []) if isinstance(tracking_probe.get("requests"), list) else []
+    )
+    tracking_email_requests = default_browser_tracking_email_requests(tracking_probe)
     accept_language = get_case_insensitive(header_echo.get("headers"), "Accept-Language")
     user_agent = get_case_insensitive(header_echo.get("headers"), "User-Agent")
 
@@ -2925,6 +3539,31 @@ def render_html(data: dict[str, object]) -> str:
         )
     else:
         browser_rows.append(["检测说明", html.escape(probe_problem_note or "浏览器侧检测未完成。")])
+
+    tracking_rows = [
+        ["结论", html.escape(tracking_probe_label)],
+        ["状态", html.escape(probe_status_label(str(tracking_probe.get("status") or "")))],
+        ["请求数量", esc(tracking_probe.get("request_count") or 0)],
+        ["邮件式自动资源", esc(len(tracking_email_requests))],
+        ["说明", html.escape(str(tracking_probe.get("reason") or tracking_probe.get("note") or ""))],
+    ]
+    tracking_request_rows: list[list[str]] = []
+    for request in tracking_probe_requests:
+        if not isinstance(request, dict):
+            continue
+        headers = request.get("headers", {}) if isinstance(request.get("headers"), dict) else {}
+        header_bits = [
+            f"UA={headers.get('User-Agent') or '缺失'}",
+            f"Accept-Language={headers.get('Accept-Language') or '缺失'}",
+            f"DNT={headers.get('DNT') or '缺失'}",
+            f"GPC={headers.get('Sec-GPC') or '缺失'}",
+        ]
+        tracking_request_rows.append(
+            [
+                f"{request.get('purpose') or 'unknown'} / {request.get('method') or 'GET'}",
+                f"<code>{html.escape(str(request.get('path') or ''))}</code><small>{html.escape(' / '.join(header_bits))}</small>",
+            ]
+        )
 
     webrtc_rows: list[list[str]] = []
     for candidate in candidates:
@@ -3519,11 +4158,12 @@ def render_html(data: dict[str, object]) -> str:
           <h1>环境一致性报告</h1>
           <p>{html.escape(posture[2])}</p>
           <div class="metrics">
-            {metric("公网出口", public_summary.get("ip") or "未知", str(public_summary.get("asn_org") or "ASN 未知"))}
-            {metric("WebRTC 暴露", webrtc_result, webrtc_detail)}
-            {metric("DNS 解析器", len(dns_nameservers), ", ".join(str(item) for item in dns_nameservers[:2]) or "未发现")}
-            {metric("浏览器 Profile", profile_count, active_language)}
-          </div>
+          {metric("公网出口", public_summary.get("ip") or "未知", str(public_summary.get("asn_org") or "ASN 未知"))}
+          {metric("WebRTC 暴露", webrtc_result, webrtc_detail)}
+          {metric("追踪模拟", tracking_probe_label, f"{len(tracking_email_requests)} 个邮件式资源请求")}
+          {metric("DNS 解析器", len(dns_nameservers), ", ".join(str(item) for item in dns_nameservers[:2]) or "未发现")}
+          {metric("浏览器 Profile", profile_count, active_language)}
+        </div>
         </div>
         <aside class="verdict">
           <span class="status status-{html.escape(posture[1])}">{html.escape(posture[0])}</span>
@@ -3540,6 +4180,7 @@ def render_html(data: dict[str, object]) -> str:
         <div class="signals">
           {signal("出口情报", ip_risk_brief, "high" if high_count else "ok", str(public_summary.get("asn_org") or ""))}
           {signal("WebRTC 暴露", webrtc_result, "medium" if private_candidates else "ok", f"公网 {public_candidates} / 本机内网 {private_candidates} / 匿名地址 {mdns_candidates}" if browser_probe_status == "ok" else webrtc_detail)}
+          {signal("追踪模拟", tracking_probe_label, "medium" if tracking_email_requests else "ok", f"{len(tracking_email_requests)} 个邮件式自动资源请求")}
           {signal("语言信号", active_language, "medium" if any("Accept-Language" in str(item.get("title") or "") for item in findings) else "ok", str(locale.get("apple_locale") or ""))}
           {signal("DNS", ", ".join(str(item) for item in dns_nameservers) or "未知", "medium" if any("DNS" in str(item.get("title") or "") for item in findings) else "ok", str(active_network.get("service") or ""))}
           {signal("代理路径", active_network.get("interface") or "未知", "ok", str(networksetup.get("service") or ""))}
@@ -3580,6 +4221,14 @@ def render_html(data: dict[str, object]) -> str:
           <article class="evidence">
             <h3>浏览器探针</h3>
             {render_table(browser_rows, "浏览器探针暂无数据。")}
+          </article>
+          <article class="evidence">
+            <h3>默认浏览器追踪模拟</h3>
+            {render_table(tracking_rows, "追踪模拟暂无数据。")}
+          </article>
+          <article class="evidence">
+            <h3>追踪请求明细</h3>
+            {render_table(tracking_request_rows, "未记录到追踪请求。")}
           </article>
           <article class="evidence">
             <h3>WebRTC 地址明细</h3>
@@ -3671,6 +4320,11 @@ def main() -> int:
         help="Skip launching a temporary headless browser for WebRTC and header checks.",
     )
     parser.add_argument(
+        "--default-browser-tracking-probe",
+        action="store_true",
+        help="Open the real default browser and test whether email-like remote tracking resources load automatically.",
+    )
+    parser.add_argument(
         "--browser-path",
         help="Explicit browser binary path for the browser-side probe.",
     )
@@ -3689,6 +4343,7 @@ def main() -> int:
         skip_network=args.skip_network,
         skip_browser_probe=args.skip_browser_probe,
         browser_path=args.browser_path,
+        run_tracking_probe=args.default_browser_tracking_probe,
     )
     json_path, md_path, html_path = write_reports(data, pathlib.Path(args.output_dir))
     open_result = None if args.no_open else open_report(html_path)
@@ -3697,6 +4352,7 @@ def main() -> int:
     high = sum(1 for item in findings if isinstance(item, dict) and item.get("severity") == "high")
     medium = sum(1 for item in findings if isinstance(item, dict) and item.get("severity") == "medium")
     browser_probe_status = (data.get("browser_probe") or {}).get("status")
+    tracking_probe_status = (data.get("default_browser_tracking_probe") or {}).get("status")
     print(f"Generated report: {md_path}")
     print(f"Generated report: {json_path}")
     print(f"Generated report: {html_path}")
@@ -3709,7 +4365,7 @@ def main() -> int:
         if open_result and open_result.get("stderr"):
             print(f"Open error: {open_result.get('stderr')}")
     print(
-        f"High findings: {high} | Medium findings: {medium} | Total findings: {len(findings)} | Browser probe: {browser_probe_status}"
+        f"High findings: {high} | Medium findings: {medium} | Total findings: {len(findings)} | Browser probe: {browser_probe_status} | Tracking probe: {tracking_probe_status}"
     )
     return 0
 

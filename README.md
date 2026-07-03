@@ -28,8 +28,9 @@
 - 检查 `LANG`、`LC_ALL`、`AppleLanguages`、`AppleLocale`
 - 检查 Chrome / Chromium / Microsoft Edge 各 profile 的 `Accept-Language`
 - 启动临时 headless Chrome / Chromium / Edge，检查浏览器实际发出的 `Accept-Language`、`navigator.language(s)`、WebRTC 地址暴露
+- 可选打开用户默认浏览器，模拟“打开邮件即加载远程追踪资源”的场景，检查 1x1 像素、CSS 背景图、beacon/fetch 是否被拦截，以及服务端可见的请求头
 - 额外识别常见代理客户端进程 / 配置路径，并对 Clash Verge / Mihomo 等可读配置生成去敏摘要
-- 自动生成中文 Markdown、结构化 HTML 和 JSON 报告
+- 自动生成 JSON、中文 Markdown 和结构化 HTML 报告；JSON 内包含 `agent_brief`，方便 Agent 直接解读风险因素与证据字段
 
 ## 兼容范围
 
@@ -109,10 +110,13 @@ cd network-fingerprint-audit
 ```bash
 ./bin/audit-network --skip-network
 ./bin/audit-network --skip-browser-probe
+./bin/audit-network --default-browser-tracking-probe
 ./bin/audit-network --no-open
 ./bin/audit-network --output-dir ./reports
 ./bin/audit-network --browser-path "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 ```
+
+`--default-browser-tracking-probe` 会显式打开系统默认浏览器，并在本机 `127.0.0.1` 启动一次性探针页面。它模拟邮件客户端打开或预览邮件时自动加载远程图片/CSS 资源的行为；用户不需要点击图片，资源请求只要被浏览器加载就会被记录。该探针不会上传数据，报告只保存在本地。
 
 ## 输出
 
@@ -126,7 +130,15 @@ cd network-fingerprint-audit
 
 - Markdown 适合快速看结论
 - HTML 适合按模块浏览和复查
-- JSON 适合做前后 diff 或接入别的自动化
+- JSON 适合做前后 diff 或接入 Agent 自动化；其中 `agent_brief` 会把原始检测压缩成账号信任 / 环境一致性诊断所需的风险等级、关键因素、证据路径、建议和未完成检测
+
+## Agent 解读模式
+
+这个仓库可以作为 Agent skill 的本地采集器使用。推荐流程是：Agent 下载或更新仓库，运行 `network_audit.py`，读取最新 JSON，然后优先解释 `agent_brief`，必要时再回到原始字段核验证据。
+
+`agent_brief` 的目标不是指导规避平台治理，而是帮助定位可能导致账号信任异常、误判或环境不一致的因素。Agent 输出建议时应引用 `evidence_paths`，并先说明 `unverified_or_failed_checks` 里哪些检测没有完成。
+
+仓库本身不会读取 Claude Code 的本地配置或 session。`agent_brief.manual_agent_checks` 会提醒 Agent 在用户同意后检查 `~/.claude/settings.json`、项目 `.claude/settings*.json`、相关 `~/.claude/projects/` session 和 `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` 等环境变量；对面向中国用户的账号信任诊断，未知中转站、共享订阅、非官方 baseURL 或非官方模型 ID 应视为高风险源，并建议先备份再清理。
 
 ## HTML 报告结构
 
@@ -159,6 +171,7 @@ cd network-fingerprint-audit
 - 当前内置的代理客户端识别只保留进程名、配置路径和去敏后的关键片段，不会整段写入订阅或 token
 - 报告默认不再写入主机名、当前工作目录；家目录绝对路径会被脱敏成 `~`
 - 浏览器探针在本地临时目录运行，结束后清理 profile
+- 默认浏览器追踪模拟只监听 `127.0.0.1`，用于记录本机默认浏览器是否自动加载类似邮件追踪的远程资源；远程服务在真实场景中看到的公网出口需结合报告里的公网 IP 情报判断
 - 生成的报告保存在本地 `reports/`，不会自动上传
 - `reports/` 已被 `.gitignore` 忽略，不建议把生成报告公开发布
 

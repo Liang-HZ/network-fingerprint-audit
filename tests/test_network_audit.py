@@ -1,10 +1,95 @@
 import unittest
+import urllib.parse
+import urllib.request
+from email.message import Message
 from unittest import mock
 
 import network_audit
 
 
 class NetworkAuditParsingTests(unittest.TestCase):
+    def test_selected_request_headers_redacts_cookie_value(self) -> None:
+        headers = Message()
+        headers["User-Agent"] = "UnitTestBrowser/1.0"
+        headers["Cookie"] = "session=secret-token"
+
+        self.assertEqual(
+            network_audit.selected_request_headers(headers),
+            {"User-Agent": "UnitTestBrowser/1.0", "Cookie": "<present>"},
+        )
+
+    def test_tracking_probe_result_label_marks_email_like_resource_loads(self) -> None:
+        self.assertEqual(
+            network_audit.default_browser_tracking_result_label(
+                {
+                    "status": "ok",
+                    "requests": [
+                        {"path": "/"},
+                        {"path": "/track/open.gif", "purpose": "email-open-pixel"},
+                    ],
+                }
+            ),
+            "追踪资源未被拦截",
+        )
+        self.assertEqual(
+            network_audit.default_browser_tracking_result_label(
+                {"status": "ok", "requests": [{"path": "/"}]}
+            ),
+            "追踪资源疑似被拦截",
+        )
+
+    def test_run_default_browser_tracking_probe_records_email_like_auto_resource_headers(
+        self,
+    ) -> None:
+        opened_urls: list[str] = []
+
+        def fake_open(url: str) -> dict[str, object]:
+            opened_urls.append(url)
+            urllib.request.urlopen(url, timeout=3).read()
+            parsed = urllib.parse.urlparse(url)
+            pixel_url = urllib.parse.urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    "/track/open.gif",
+                    "",
+                    "source=unit-test",
+                    "",
+                )
+            )
+            pixel_request = urllib.request.Request(
+                pixel_url,
+                headers={
+                    "User-Agent": "UnitTestBrowser/1.0",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "DNT": "1",
+                },
+            )
+            urllib.request.urlopen(pixel_request, timeout=3).read()
+            return {"ok": True, "method": "test-open"}
+
+        result = network_audit.run_default_browser_tracking_probe(
+            skip_tracking_probe=False,
+            open_url=fake_open,
+            wait_seconds=0.05,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(opened_urls), 1)
+        self.assertEqual(
+            network_audit.default_browser_tracking_result_label(result),
+            "追踪资源未被拦截",
+        )
+        tracking_requests = [
+            item
+            for item in result["requests"]
+            if item.get("purpose") == "email-open-pixel"
+        ]
+        self.assertEqual(len(tracking_requests), 1)
+        self.assertEqual(tracking_requests[0]["headers"]["User-Agent"], "UnitTestBrowser/1.0")
+        self.assertEqual(tracking_requests[0]["headers"]["Accept-Language"], "en-US,en;q=0.9")
+        self.assertEqual(tracking_requests[0]["headers"]["DNT"], "1")
+
     def test_parse_cloudflare_trace_extracts_key_value_pairs(self) -> None:
         raw = """fl=1164f50
 ip=2605:52c0:1:b90:c438:caff:fe66:a8fc
@@ -54,6 +139,142 @@ malformed
         self.assertEqual(findings[0]["title"], "External IP intelligence flags egress risk")
         self.assertIn("ipapi.is:datacenter", findings[0]["detail"])
         self.assertIn("proxycheck:proxy=VPN", findings[0]["detail"])
+
+    def test_make_findings_mentions_default_browser_tracking_when_resources_load(
+        self,
+    ) -> None:
+        findings = network_audit.make_findings(
+            {
+                "default_browser_tracking_probe": {
+                    "status": "ok",
+                    "requests": [
+                        {
+                            "purpose": "email-open-pixel",
+                            "headers": {
+                                "User-Agent": "UnitTestBrowser/1.0",
+                                "Accept-Language": "en-US,en;q=0.9",
+                            },
+                        }
+                    ],
+                }
+            }
+        )
+        self.assertEqual(
+            findings[0]["title"],
+            "Default browser loads email-like tracking resources",
+        )
+        self.assertIn("email-open-pixel", findings[0]["detail"])
+        self.assertIn("Accept-Language=en-US,en;q=0.9", findings[0]["detail"])
+
+    def test_build_agent_brief_summarizes_account_trust_environment_signals(
+        self,
+    ) -> None:
+        data = {
+            "collection_errors": ["dns: scutil --dns failed (timeout)"],
+            "public_ip": {
+                "ipapi_is": {
+                    "ip": "203.0.113.10",
+                    "asn": {"org": "Example Hosting", "type": "hosting"},
+                    "location": {"country_code": "US", "timezone": "America/Los_Angeles"},
+                    "is_datacenter": True,
+                    "is_proxy": False,
+                    "is_vpn": True,
+                    "is_tor": False,
+                    "is_abuser": False,
+                },
+                "proxycheck": {"proxy": "yes", "type": "VPN", "risk": 66},
+                "observed_ips": ["203.0.113.10"],
+            },
+            "browser_probe": {"status": "skipped", "reason": "Browser probe was skipped by configuration."},
+            "default_browser_tracking_probe": {
+                "status": "ok",
+                "requests": [{"purpose": "email-open-pixel"}],
+            },
+            "findings": [
+                {
+                    "severity": "high",
+                    "title": "External IP intelligence flags egress risk",
+                    "detail": "ipapi.is:datacenter; ipapi.is:vpn; proxycheck:proxy=VPN",
+                },
+                {
+                    "severity": "info",
+                    "title": "Default browser loads email-like tracking resources",
+                    "detail": "email-open-pixel=1",
+                },
+            ],
+            "recommendations": [
+                {
+                    "priority": "P1",
+                    "area": "Egress Reputation",
+                    "action": "Use a stable low-abuse egress for baseline testing.",
+                    "why": "Hosting ASNs are more likely to trigger trust checks.",
+                }
+            ],
+        }
+
+        brief = network_audit.build_agent_brief(data)
+
+        self.assertEqual(brief["schema_version"], "agent-brief-v1")
+        self.assertEqual(brief["purpose"], "account_trust_environment_diagnostics")
+        self.assertEqual(brief["overall_level"], "high")
+        self.assertEqual(brief["risk_counts"], {"high": 1, "medium": 0, "low": 0, "info": 1})
+        self.assertEqual(brief["top_factors"][0]["title"], "External IP intelligence flags egress risk")
+        self.assertEqual(brief["top_factors"][0]["agent_focus"], "egress_reputation")
+        self.assertIn("public_ip.ipapi_is", brief["top_factors"][0]["evidence_paths"])
+        self.assertIn("dns: scutil --dns failed (timeout)", brief["unverified_or_failed_checks"])
+        self.assertTrue(
+            any(
+                item.startswith("browser_probe: skipped")
+                for item in brief["unverified_or_failed_checks"]
+            )
+        )
+        self.assertEqual(brief["tracking_probe"]["label"], "追踪资源未被拦截")
+        self.assertEqual(brief["next_actions"][0]["priority"], "P1")
+        self.assertIn("diagnose risk factors", brief["agent_instructions"][0])
+        self.assertEqual(
+            brief["manual_agent_checks"]["claude_code_local_config"]["risk_level"],
+            "high_if_non_official_trace_found",
+        )
+        self.assertIn(
+            "~/.claude/settings.json",
+            brief["manual_agent_checks"]["claude_code_local_config"]["paths_to_review"],
+        )
+        self.assertIn(
+            "ANTHROPIC_BASE_URL",
+            brief["manual_agent_checks"]["claude_code_local_config"]["env_vars_to_review"],
+        )
+        self.assertIn(
+            "unknown ANTHROPIC_BASE_URL or relay domain",
+            brief["manual_agent_checks"]["claude_code_local_config"]["high_risk_traces"],
+        )
+        self.assertIn(
+            "back up .claude before deleting suspicious settings or sessions",
+            brief["manual_agent_checks"]["claude_code_local_config"]["cleanup_guidance"][0],
+        )
+        self.assertIn(
+            "no non-official Claude Code config/session traces",
+            brief["low_risk_profile"]["required_conditions"],
+        )
+
+    def test_attach_analysis_fields_adds_findings_recommendations_and_agent_brief(
+        self,
+    ) -> None:
+        data = {
+            "public_ip": {
+                "ipapi_is": {
+                    "is_datacenter": True,
+                    "asn": {"type": "hosting"},
+                },
+                "proxycheck": {},
+            }
+        }
+
+        network_audit.attach_analysis_fields(data)
+
+        self.assertEqual(data["findings"][0]["title"], "External IP intelligence flags egress risk")
+        self.assertEqual(data["recommendations"][0]["area"], "Egress Reputation")
+        self.assertEqual(data["agent_brief"]["purpose"], "account_trust_environment_diagnostics")
+        self.assertEqual(data["agent_brief"]["overall_level"], "high")
 
     def test_browser_probe_result_label_uses_user_facing_webrtc_language(self) -> None:
         self.assertEqual(
