@@ -2,6 +2,22 @@
 
 一个面向 macOS / Windows 的本地审计工具，用来检查“网络出口、DNS、代理、语言环境、浏览器语言信号、浏览器侧 WebRTC / Header 暴露”是否彼此一致。
 
+## 产品定位
+
+这个仓库是 liangai.org 产品矩阵之一：一个“网络与浏览器环境一致性审计”CLI 工具，核心能力是把出口 IP/ASN、系统 DNS/代理/路由、语言环境、浏览器 `Accept-Language`/WebRTC 暴露等分散信号，采集成结构化的 JSON / Markdown / HTML 报告，用于排查“环境不一致”问题（详见上文“它解决什么问题”）。
+
+产品形态与部署：
+
+- 无独立服务端部署，也不挂独立子域名；产品即“GitHub 开源仓库 + 本地 CLI”，用户 `git clone` 后直接在本机运行
+- 对应的落地页挂在主站 liangai.org 的 `/products/network-audit` 路径下（落地页内容由 liangai-web 仓库的其他任务维护，本仓库只负责工具本身和这份 README）
+
+与 `claude-code-trust-audit` skill 的关系：
+
+- 本机已确认存在该 skill，路径为 `~/.codex/skills/claude-code-trust-audit/`（这是 Codex CLI 侧的 skill，不在 `~/.claude/skills/` 下）
+- 关系是明确的“调用”而非单纯概念呼应：该 skill 的工作流第一步就是运行其 `scripts/run_network_audit.py` 下载并驱动本仓库（`network_audit.py`），推荐参数为 `python3 network_audit.py --default-browser-tracking-probe --no-open`
+- 该 skill 读取本仓库产出 JSON 中的 `agent_brief` 字段（风险等级、关键因素、证据路径、未完成检测）作为 Claude Code / Codex 账号信任与环境一致性诊断的输入，再结合对 `~/.claude` 等本地配置的检查（需用户单独同意）产出审计报告
+- 简言之：本仓库是通用的网络/浏览器指纹采集器，`claude-code-trust-audit` skill 是面向“Claude Code 账号信任风险”场景的上层封装，二者是底层工具与场景化上层封装的关系，可以独立使用，也可以配合使用
+
 ## 关于作者
 
 我是一个充满好奇心的 AI 应用从业者，关注 AI 产品、自动化工作流，以及把复杂系统整理成可实际落地的工具。
